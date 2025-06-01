@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Any
 
-import openhands
+import app
 from app.core.schema import ActionType
 from app.events.action.action import Action, ActionSecurityRisk
 
@@ -45,7 +45,7 @@ class SystemMessageAction(Action):
 
     content: str
     tools: list[Any] | None = None
-    openhands_version: str | None = app.__version__
+    openreplica_version: str | None = app.__version__
     agent_class: str | None = None
     action: ActionType = ActionType.SYSTEM
 

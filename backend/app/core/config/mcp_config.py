@@ -187,9 +187,9 @@ class OpenReplicaMCPConfig:
         return sse_server, stdio_servers
 
 
-openhands_mcp_config_cls = os.environ.get(
-    'OPENHANDS_MCP_CONFIG_CLS',
+openreplica_mcp_config_cls = os.environ.get(
+    'OPENREPLICA_MCP_CONFIG_CLS',
     'app.core.config.mcp_config.OpenReplicaMCPConfig',
 )
 
-OpenReplicaMCPConfigImpl = get_impl(OpenReplicaMCPConfig, openhands_mcp_config_cls)
+OpenReplicaMCPConfigImpl = get_impl(OpenReplicaMCPConfig, openreplica_mcp_config_cls)

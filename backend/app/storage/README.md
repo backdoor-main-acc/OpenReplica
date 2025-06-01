@@ -1,6 +1,6 @@
-# OpenHands Storage Module
+# OpenReplica Storage Module
 
-The storage module provides different storage options for file operations in OpenHands, used for storing events, settings and other metadata. This module implements a common interface (`FileStore`) that allows for interchangeable storage backends.
+The storage module provides different storage options for file operations in OpenReplica, used for storing events, settings and other metadata. This module implements a common interface (`FileStore`) that allows for interchangeable storage backends.
 
 **Usage:**
 ```python
@@ -75,7 +75,7 @@ The `WebHookFileStore` wraps another `FileStore` implementation and sends HTTP r
 
 ## Configuration
 
-To configure the storage module in OpenHands, use the following configuration options:
+To configure the storage module in OpenReplica, use the following configuration options:
 
 ```toml
 [core]

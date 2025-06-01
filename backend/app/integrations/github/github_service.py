@@ -504,7 +504,7 @@ class GitHubService(BaseGitService, GitService):
 
 
 github_service_cls = os.environ.get(
-    'OPENHANDS_GITHUB_SERVICE_CLS',
+    'OPENREPLICA_GITHUB_SERVICE_CLS',
     'app.integrations.github.github_service.GitHubService',
 )
 GithubServiceImpl = get_impl(GitHubService, github_service_cls)

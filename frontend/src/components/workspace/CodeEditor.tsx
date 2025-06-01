@@ -23,7 +23,7 @@ function example() {
   console.log("Hello from OpenReplica!");
   
   // Your code here
-  return "Enhanced OpenHands Platform";
+  return "Enhanced OpenReplica Platform";
 }
 
 export default example;`,

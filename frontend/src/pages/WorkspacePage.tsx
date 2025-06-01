@@ -10,6 +10,7 @@ import {
   PlayIcon,
   StopIcon,
   Cog6ToothIcon,
+  CpuChipIcon,
 } from '@heroicons/react/24/outline'
 import { useSession, useAppStore } from '../stores/appStore'
 import { useWebSocket } from '../services/websocket'
@@ -18,12 +19,15 @@ import Terminal from '../components/workspace/Terminal'
 import FileExplorer from '../components/workspace/FileExplorer'
 import ChatPanel from '../components/workspace/ChatPanel'
 import AgentStatus from '../components/workspace/AgentStatus'
+import AgentActivityPanel from '../components/workspace/AgentActivityPanel'
+import AgentExecutionTimeline from '../components/workspace/AgentExecutionTimeline'
 
 const WorkspacePage: React.FC = () => {
   const { sessionId } = useParams<{ sessionId: string }>()
   const { currentSessionId, setCurrentSessionId } = useSession()
   const { selectedAgent, connected } = useAppStore()
-  const [activeTab, setActiveTab] = useState<'editor' | 'terminal' | 'chat' | 'files'>('editor')
+  const [activeTab, setActiveTab] = useState<'editor' | 'terminal' | 'chat' | 'files' | 'agent'>('editor')
+  const [showAgentPanel, setShowAgentPanel] = useState(true)
   const [agentRunning, setAgentRunning] = useState(false)
   const [currentFile, setCurrentFile] = useState<string | null>(null)
 
@@ -90,6 +94,7 @@ const WorkspacePage: React.FC = () => {
     { id: 'terminal', label: 'Terminal', icon: CommandLineIcon },
     { id: 'chat', label: 'Chat', icon: ChatBubbleLeftRightIcon },
     { id: 'files', label: 'Files', icon: FolderIcon },
+    { id: 'agent', label: 'Agent Timeline', icon: CpuChipIcon },
   ]
 
   if (!currentSessionId) {
@@ -238,8 +243,30 @@ const WorkspacePage: React.FC = () => {
                 />
               </div>
             )}
+            {activeTab === 'agent' && (
+              <AgentExecutionTimeline 
+                sessionId={currentSessionId}
+                isAgentRunning={agentRunning}
+              />
+            )}
           </div>
         </div>
+
+        {/* Right Panel - Agent Activity (when agent is running or toggle is on) */}
+        {(agentRunning || showAgentPanel) && (
+          <motion.div
+            className="w-80 bg-slate-900 border-l border-slate-700"
+            initial={{ width: 0, opacity: 0 }}
+            animate={{ width: 320, opacity: 1 }}
+            exit={{ width: 0, opacity: 0 }}
+            transition={{ duration: 0.3 }}
+          >
+            <AgentActivityPanel 
+              sessionId={currentSessionId}
+              isAgentRunning={agentRunning}
+            />
+          </motion.div>
+        )}
       </div>
 
       {/* Status Bar */}

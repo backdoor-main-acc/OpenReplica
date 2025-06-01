@@ -496,7 +496,7 @@ class GitLabService(BaseGitService, GitService):
 
 
 gitlab_service_cls = os.environ.get(
-    'OPENHANDS_GITLAB_SERVICE_CLS',
+    'OPENREPLICA_GITLAB_SERVICE_CLS',
     'app.integrations.gitlab.gitlab_service.GitLabService',
 )
 GitLabServiceImpl = get_impl(GitLabService, gitlab_service_cls)

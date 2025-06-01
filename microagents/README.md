@@ -1,20 +1,20 @@
-# OpenHands Microagents
+# OpenReplica Microagents
 
-Microagents are specialized prompts that enhance OpenHands with domain-specific knowledge and task-specific workflows. They help developers by providing expert guidance, automating common tasks, and ensuring consistent practices across projects. Each microagent is designed to excel in a specific area, from Git operations to code review processes.
+Microagents are specialized prompts that enhance OpenReplica with domain-specific knowledge and task-specific workflows. They help developers by providing expert guidance, automating common tasks, and ensuring consistent practices across projects. Each microagent is designed to excel in a specific area, from Git operations to code review processes.
 
 ## Sources of Microagents
 
-OpenHands loads microagents from two sources:
+OpenReplica loads microagents from two sources:
 
 ### 1. Shareable Microagents (Public)
-This directory (`OpenHands/microagents/`) contains shareable microagents that are:
-- Available to all OpenHands users
-- Maintained in the OpenHands repository
+This directory (`OpenReplica/microagents/`) contains shareable microagents that are:
+- Available to all OpenReplica users
+- Maintained in the OpenReplica repository
 - Perfect for reusable knowledge and common workflows
 
 Directory structure:
 ```
-OpenHands/microagents/
+OpenReplica/microagents/
 ├── # Keyword-triggered expertise
 │   ├── git.md         # Git operations
 │   ├── testing.md     # Testing practices
@@ -26,7 +26,7 @@ OpenHands/microagents/
 ```
 
 ### 2. Repository Instructions (Private)
-Each repository can have its own instructions in `.openhands/microagents/repo.md`. These instructions are:
+Each repository can have its own instructions in `.openreplica/microagents/repo.md`. These instructions are:
 - Private to that repository
 - Automatically loaded when working with that repository
 - Perfect for repository-specific guidelines and team practices
@@ -34,7 +34,7 @@ Each repository can have its own instructions in `.openhands/microagents/repo.md
 Example repository structure:
 ```
 your-repository/
-└── .openhands/
+└── .openreplica/
     └── microagents/
         └── repo.md    # Repository-specific instructions
         └── ...        # Private micro-agents that are only available inside this repo
@@ -43,8 +43,8 @@ your-repository/
 
 ## Loading Order
 
-When OpenHands works with a repository, it:
-1. Loads repository-specific instructions from `.openhands/microagents/repo.md` if present
+When OpenReplica works with a repository, it:
+1. Loads repository-specific instructions from `.openreplica/microagents/repo.md` if present
 2. Loads relevant knowledge agents based on keywords in conversations
 
 ## Types of Microagents
@@ -66,12 +66,12 @@ Key characteristics:
 - **Reusable**: Knowledge can be applied across multiple projects
 - **Versioned**: Support multiple versions of tools/frameworks
 
-You can see an example of a knowledge-based agent in [OpenHands's github microagent](https://github.com/All-Hands-AI/OpenHands/tree/main/microagents/github.md).
+You can see an example of a knowledge-based agent in [OpenReplica's github microagent](https://github.com/All-Hands-AI/OpenReplica/tree/main/microagents/github.md).
 
 ### 2. Repository Agents
 
 Repository agents provide repository-specific knowledge and guidelines. They are:
-- Loaded from `.openhands/microagents/repo.md`
+- Loaded from `.openreplica/microagents/repo.md`
 - Specific to individual repositories
 - Automatically activated for their repository
 - Perfect for team practices and project conventions
@@ -82,7 +82,7 @@ Key features:
 - **Always active**: Automatically loaded for the repository
 - **Locally maintained**: Updated with the project
 
-You can see an example of a repo agent in [the agent for the OpenHands repo itself](https://github.com/All-Hands-AI/OpenHands/blob/main/.openhands/microagents/repo.md).
+You can see an example of a repo agent in [the agent for the OpenReplica repo itself](https://github.com/All-Hands-AI/OpenReplica/blob/main/.openreplica/microagents/repo.md).
 
 
 ## Contributing
@@ -124,11 +124,11 @@ You can see an example of a repo agent in [the agent for the OpenHands repo itse
 
 1. Create your agent file in the appropriate directory:
    - `microagents/` for expertise (public, shareable)
-   - Note: Repository-specific agents should remain in their respective repositories' `.openhands/microagents/` directory
+   - Note: Repository-specific agents should remain in their respective repositories' `.openreplica/microagents/` directory
 2. Test thoroughly
-3. Submit a pull request to OpenHands
+3. Submit a pull request to OpenReplica
 
 
 ## License
 
-All microagents are subject to the same license as OpenHands. See the root LICENSE file for details.
+All microagents are subject to the same license as OpenReplica. See the root LICENSE file for details.

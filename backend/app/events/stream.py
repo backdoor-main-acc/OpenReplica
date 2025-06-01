@@ -23,7 +23,7 @@ from app.utils.shutdown_listener import should_continue
 class EventStreamSubscriber(str, Enum):
     AGENT_CONTROLLER = 'agent_controller'
     SECURITY_ANALYZER = 'security_analyzer'
-    RESOLVER = 'openhands_resolver'
+    RESOLVER = 'openreplica_resolver'
     SERVER = 'server'
     RUNTIME = 'runtime'
     MEMORY = 'memory'
