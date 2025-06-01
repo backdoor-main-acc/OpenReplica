@@ -9,7 +9,7 @@ import uuid
 
 from app.core.logger import openreplica_logger as logger
 
-router = APIRouter()
+router = APIRouter(prefix='/api/sessions')
 
 # In-memory store for demo (use database in production)
 active_sessions: Dict[str, Dict[str, Any]] = {}
@@ -237,3 +237,7 @@ def get_session_by_id(session_id: str) -> Dict[str, Any]:
     if session_id not in active_sessions:
         raise HTTPException(status_code=404, detail="Session not found")
     return active_sessions[session_id]
+
+
+# Export router as app for consistency with other route modules
+app = router

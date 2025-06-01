@@ -9,7 +9,7 @@ from app.agents import create_agent, get_available_agents, AgentConfig
 from app.agents.base import AgentState
 from app.core.logger import openreplica_logger as logger
 
-router = APIRouter()
+router = APIRouter(prefix='/api/agents')
 
 # In-memory store for demo (use database in production)
 active_agents: Dict[str, Any] = {}
@@ -158,3 +158,7 @@ def get_agent_by_id(agent_id: str):
     if agent_id not in active_agents:
         raise HTTPException(status_code=404, detail="Agent not found")
     return active_agents[agent_id]["agent"]
+
+
+# Export router as app for consistency with other route modules
+app = router

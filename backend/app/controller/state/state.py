@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-import openhands
+import app
 from app.core.logger import openreplica_logger as logger
 from app.core.schema import AgentState
 from app.events.action import (
@@ -219,7 +219,7 @@ class State:
             'tags': [
                 f'agent:{agent_name}',
                 f'web_host:{os.environ.get("WEB_HOST", "unspecified")}',
-                f'openhands_version:{app.__version__}',
+                f'openreplica_version:{app.__version__}',
             ],
         }
 

@@ -33,6 +33,7 @@ from app.server.routes.agents import app as agents_api_router
 from app.server.routes.microagents import app as microagents_api_router
 from app.server.routes.sessions import app as sessions_api_router
 from app.server.routes.websocket_routes import app as websocket_api_router
+from app.server.routes.files_api import app as files_session_api_router
 
 from app.server.shared import conversation_manager
 
@@ -68,5 +69,6 @@ app.include_router(agents_api_router)
 app.include_router(microagents_api_router)
 app.include_router(sessions_api_router)
 app.include_router(websocket_api_router)
+app.include_router(files_session_api_router)
 
 add_health_endpoints(app)

@@ -157,7 +157,7 @@ const Sidebar: React.FC = () => {
           >
             OpenReplica v1.0.0
             <br />
-            Enhanced OpenHands
+            Enhanced OpenReplica
           </motion.div>
         )}
       </div>

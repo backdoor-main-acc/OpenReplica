@@ -142,7 +142,7 @@ const HomePage: React.FC = () => {
               </div>
               <div className="text-left">
                 <h1 className="text-5xl font-bold text-white">OpenReplica</h1>
-                <p className="text-xl text-blue-400">Enhanced OpenHands Platform</p>
+                <p className="text-xl text-blue-400">Enhanced OpenReplica Platform</p>
               </div>
             </motion.div>
 

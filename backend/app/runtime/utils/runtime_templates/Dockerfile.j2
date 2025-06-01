@@ -1,14 +1,14 @@
 FROM {{ base_image }}
 
 # Shared environment variables
-ENV POETRY_VIRTUALENVS_PATH=/openhands/poetry \
-    MAMBA_ROOT_PREFIX=/openhands/micromamba \
+ENV POETRY_VIRTUALENVS_PATH=/openreplica/poetry \
+    MAMBA_ROOT_PREFIX=/openreplica/micromamba \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     EDITOR=code \
     VISUAL=code \
     GIT_EDITOR="code --wait" \
-    OPENVSCODE_SERVER_ROOT=/openhands/.openvscode-server
+    OPENVSCODE_SERVER_ROOT=/openreplica/.openvscode-server
 
 {% macro setup_base_system() %}
 
@@ -38,19 +38,19 @@ RUN ln -s "$(dirname $(which node))/corepack" /usr/local/bin/corepack && \
 {% endif %}
 
 # Install uv (required by MCP)
-RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="/openhands/bin" sh
-# Add /openhands/bin to PATH
-ENV PATH="/openhands/bin:${PATH}"
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="/openreplica/bin" sh
+# Add /openreplica/bin to PATH
+ENV PATH="/openreplica/bin:${PATH}"
 
-# Remove UID 1000 named pn or ubuntu, so the 'openhands' user can be created from ubuntu hosts
+# Remove UID 1000 named pn or ubuntu, so the 'openreplica' user can be created from ubuntu hosts
 RUN (if getent passwd 1000 | grep -q pn; then userdel pn; fi) && \
     (if getent passwd 1000 | grep -q ubuntu; then userdel ubuntu; fi)
 
 
 # Create necessary directories
-RUN mkdir -p /openhands && \
-    mkdir -p /openhands/logs && \
-    mkdir -p /openhands/poetry
+RUN mkdir -p /openreplica && \
+    mkdir -p /openreplica/logs && \
+    mkdir -p /openreplica/poetry
 
 {% endmacro %}
 
@@ -91,11 +91,11 @@ RUN if [ -z "${RELEASE_TAG}" ]; then \
 
 {% macro install_vscode_extensions() %}
 # Install our custom extension
-RUN mkdir -p ${OPENVSCODE_SERVER_ROOT}/extensions/openhands-hello-world && \
-    cp -r /openhands/code/openhands/runtime/utils/vscode-extensions/hello-world/* ${OPENVSCODE_SERVER_ROOT}/extensions/openhands-hello-world/
+RUN mkdir -p ${OPENVSCODE_SERVER_ROOT}/extensions/openreplica-hello-world && \
+    cp -r /openreplica/code/openreplica/runtime/utils/vscode-extensions/hello-world/* ${OPENVSCODE_SERVER_ROOT}/extensions/openreplica-hello-world/
 
-RUN mkdir -p ${OPENVSCODE_SERVER_ROOT}/extensions/openhands-memory-monitor && \
-    cp -r /openhands/code/openhands/runtime/utils/vscode-extensions/memory-monitor/* ${OPENVSCODE_SERVER_ROOT}/extensions/openhands-memory-monitor/
+RUN mkdir -p ${OPENVSCODE_SERVER_ROOT}/extensions/openreplica-memory-monitor && \
+    cp -r /openreplica/code/openreplica/runtime/utils/vscode-extensions/memory-monitor/* ${OPENVSCODE_SERVER_ROOT}/extensions/openreplica-memory-monitor/
 
 # Some extension dirs are removed because they trigger false positives in vulnerability scans.
 RUN rm -rf ${OPENVSCODE_SERVER_ROOT}/extensions/{handlebars,pug,json,diff,grunt,ini,npm}
@@ -103,32 +103,32 @@ RUN rm -rf ${OPENVSCODE_SERVER_ROOT}/extensions/{handlebars,pug,json,diff,grunt,
 
 {% macro install_dependencies() %}
 # Install all dependencies
-WORKDIR /openhands/code
+WORKDIR /openreplica/code
 
 # Configure micromamba and poetry
-RUN /openhands/micromamba/bin/micromamba config set changeps1 False && \
-    /openhands/micromamba/bin/micromamba run -n openhands poetry config virtualenvs.path /openhands/poetry && \
-    /openhands/micromamba/bin/micromamba run -n openhands poetry env use python3.12
+RUN /openreplica/micromamba/bin/micromamba config set changeps1 False && \
+    /openreplica/micromamba/bin/micromamba run -n openreplica poetry config virtualenvs.path /openreplica/poetry && \
+    /openreplica/micromamba/bin/micromamba run -n openreplica poetry env use python3.12
 
 # Install project dependencies in smaller chunks
-RUN /openhands/micromamba/bin/micromamba run -n openhands poetry install --only main --no-interaction --no-root
+RUN /openreplica/micromamba/bin/micromamba run -n openreplica poetry install --only main --no-interaction --no-root
 
-RUN /openhands/micromamba/bin/micromamba run -n openhands poetry install --only runtime --no-interaction --no-root
+RUN /openreplica/micromamba/bin/micromamba run -n openreplica poetry install --only runtime --no-interaction --no-root
 
 # Install playwright and its dependencies
 RUN apt-get update && \
-    /openhands/micromamba/bin/micromamba run -n openhands poetry run pip install playwright && \
-    /openhands/micromamba/bin/micromamba run -n openhands poetry run playwright install --with-deps chromium
+    /openreplica/micromamba/bin/micromamba run -n openreplica poetry run pip install playwright && \
+    /openreplica/micromamba/bin/micromamba run -n openreplica poetry run playwright install --with-deps chromium
 
 # Set environment variables and permissions
-RUN /openhands/micromamba/bin/micromamba run -n openhands poetry run python -c "import sys; print('OH_INTERPRETER_PATH=' + sys.executable)" >> /etc/environment && \
-    chmod -R g+rws /openhands/poetry && \
-    mkdir -p /openhands/workspace && chmod -R g+rws,o+rw /openhands/workspace
+RUN /openreplica/micromamba/bin/micromamba run -n openreplica poetry run python -c "import sys; print('OH_INTERPRETER_PATH=' + sys.executable)" >> /etc/environment && \
+    chmod -R g+rws /openreplica/poetry && \
+    mkdir -p /openreplica/workspace && chmod -R g+rws,o+rw /openreplica/workspace
 
 # Clear caches
-RUN /openhands/micromamba/bin/micromamba run -n openhands poetry cache clear --all . -n && \
+RUN /openreplica/micromamba/bin/micromamba run -n openreplica poetry cache clear --all . -n && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* && \
-    /openhands/micromamba/bin/micromamba clean --all
+    /openreplica/micromamba/bin/micromamba clean --all
 
 {% endmacro %}
 
@@ -137,27 +137,27 @@ RUN /openhands/micromamba/bin/micromamba run -n openhands poetry cache clear --a
 # START: Build Runtime Image from Scratch
 # ================================================================
 # This is used in cases where the base image is something more generic like nikolaik/python-nodejs
-# rather than the current OpenHands release
+# rather than the current OpenReplica release
 
 {{ setup_base_system() }}
 
 # Install micromamba
-RUN mkdir -p /openhands/micromamba/bin && \
-    /bin/bash -c "PREFIX_LOCATION=/openhands/micromamba BIN_FOLDER=/openhands/micromamba/bin INIT_YES=no CONDA_FORGE_YES=yes $(curl -L https://micro.mamba.pm/install.sh)" && \
-    /openhands/micromamba/bin/micromamba config remove channels defaults && \
-    /openhands/micromamba/bin/micromamba config list
+RUN mkdir -p /openreplica/micromamba/bin && \
+    /bin/bash -c "PREFIX_LOCATION=/openreplica/micromamba BIN_FOLDER=/openreplica/micromamba/bin INIT_YES=no CONDA_FORGE_YES=yes $(curl -L https://micro.mamba.pm/install.sh)" && \
+    /openreplica/micromamba/bin/micromamba config remove channels defaults && \
+    /openreplica/micromamba/bin/micromamba config list
 
-# Create the openhands virtual environment and install poetry and python
-RUN /openhands/micromamba/bin/micromamba create -n openhands -y && \
-    /openhands/micromamba/bin/micromamba install -n openhands -c conda-forge poetry python=3.12 -y
+# Create the openreplica virtual environment and install poetry and python
+RUN /openreplica/micromamba/bin/micromamba create -n openreplica -y && \
+    /openreplica/micromamba/bin/micromamba install -n openreplica -c conda-forge poetry python=3.12 -y
 
-# Create a clean openhands directory including only the pyproject.toml, poetry.lock and openhands/__init__.py
+# Create a clean openreplica directory including only the pyproject.toml, poetry.lock and openreplica/__init__.py
 RUN \
-    if [ -d /openhands/code ]; then rm -rf /openhands/code; fi && \
-    mkdir -p /openhands/code/openhands && \
-    touch /openhands/code/openhands/__init__.py
+    if [ -d /openreplica/code ]; then rm -rf /openreplica/code; fi && \
+    mkdir -p /openreplica/code/openreplica && \
+    touch /openreplica/code/openreplica/__init__.py
 
-COPY ./code/pyproject.toml ./code/poetry.lock /openhands/code/
+COPY ./code/pyproject.toml ./code/poetry.lock /openreplica/code/
 
 {{ install_dependencies() }}
 
@@ -169,11 +169,11 @@ COPY ./code/pyproject.toml ./code/poetry.lock /openhands/code/
 # ================================================================
 # Copy Project source files
 # ================================================================
-RUN if [ -d /openhands/code/openhands ]; then rm -rf /openhands/code/openhands; fi
-COPY ./code/pyproject.toml ./code/poetry.lock /openhands/code/
+RUN if [ -d /openreplica/code/openreplica ]; then rm -rf /openreplica/code/openreplica; fi
+COPY ./code/pyproject.toml ./code/poetry.lock /openreplica/code/
 
-COPY ./code/openhands /openhands/code/openhands
-RUN chmod a+rwx /openhands/code/openhands/__init__.py
+COPY ./code/openreplica /openreplica/code/openreplica
+RUN chmod a+rwx /openreplica/code/openreplica/__init__.py
 
 {{ setup_vscode_server() }}
 

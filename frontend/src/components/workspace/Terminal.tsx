@@ -89,7 +89,7 @@ const Terminal: React.FC<TerminalProps> = ({ sessionId }) => {
     // Initialize terminal with welcome message
     setTimeout(() => {
       terminal.writeln('\x1b[1;34mWelcome to OpenReplica Terminal\x1b[0m')
-      terminal.writeln('\x1b[32mEnhanced OpenHands Development Environment\x1b[0m')
+      terminal.writeln('\x1b[32mEnhanced OpenReplica Development Environment\x1b[0m')
       terminal.writeln('')
       terminal.write('\x1b[36mopenreplica@workspace\x1b[0m:\x1b[34m~/project\x1b[0m$ ')
       

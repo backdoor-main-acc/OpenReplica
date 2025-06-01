@@ -40,7 +40,7 @@ class OpenReplicaConfig(BaseModel):
         workspace_mount_path_in_sandbox (deprecated): Path to mount the workspace in sandbox. Defaults to `/workspace`.
         workspace_mount_rewrite (deprecated): Path to rewrite the workspace mount path.
         cache_dir: Path to cache directory. Defaults to `/tmp/cache`.
-        run_as_openhands: Whether to run as app.
+        run_as_openreplica: Whether to run as app.
         max_iterations: Maximum number of iterations allowed.
         max_budget_per_task: Maximum budget per task, agent stops if exceeded.
         e2b_api_key: E2B API key.
@@ -63,7 +63,7 @@ class OpenReplicaConfig(BaseModel):
     extended: ExtendedConfig = Field(default_factory=lambda: ExtendedConfig({}))
     runtime: str = Field(default='docker')
     file_store: str = Field(default='local')
-    file_store_path: str = Field(default='/tmp/openhands_file_store')
+    file_store_path: str = Field(default='/tmp/openreplica_file_store')
     file_store_web_hook_url: str | None = Field(default=None)
     file_store_web_hook_headers: dict | None = Field(default=None)
     save_trajectory_path: str | None = Field(default=None)
@@ -82,7 +82,7 @@ class OpenReplicaConfig(BaseModel):
     # End of deprecated parameters
 
     cache_dir: str = Field(default='/tmp/cache')
-    run_as_openhands: bool = Field(default=True)
+    run_as_openreplica: bool = Field(default=True)
     max_iterations: int = Field(default=OH_MAX_ITERATIONS)
     max_budget_per_task: float | None = Field(default=None)
     e2b_api_key: SecretStr | None = Field(default=None)

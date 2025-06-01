@@ -1,9 +1,9 @@
 {
-    "name": "openhands-hello-world",
-    "displayName": "OpenHands Hello World",
-    "description": "A simple hello world extension for OpenHands",
+    "name": "openreplica-hello-world",
+    "displayName": "OpenReplica Hello World",
+    "description": "A simple hello world extension for OpenReplica",
     "version": "0.0.1",
-    "publisher": "openhands",
+    "publisher": "openreplica",
     "engines": {
         "vscode": "^1.98.2"
     },
@@ -11,13 +11,13 @@
         "Other"
     ],
     "activationEvents": [
-        "onCommand:openhands-hello-world.helloWorld"
+        "onCommand:openreplica-hello-world.helloWorld"
     ],
     "main": "./extension.js",
     "contributes": {
         "commands": [{
-            "command": "openhands-hello-world.helloWorld",
-            "title": "Hello World from OpenHands"
+            "command": "openreplica-hello-world.helloWorld",
+            "title": "Hello World from OpenReplica"
         }]
     }
 }

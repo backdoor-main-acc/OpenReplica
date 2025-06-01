@@ -12,7 +12,7 @@ import toml
 from dotenv import load_dotenv
 from pydantic import BaseModel, SecretStr, ValidationError
 
-from openhands import __version__
+from app import __version__
 from app.core import logger
 from app.core.config.agent_config import AgentConfig
 from app.core.config.condenser_config import (

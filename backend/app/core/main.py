@@ -60,7 +60,7 @@ async def run_controller(
 ) -> State | None:
     """Main coroutine to run the agent controller with task input flexibility.
 
-    It's only used when you launch openhands backend directly via cmdline.
+    It's only used when you launch openreplica backend directly via cmdline.
 
     Args:
         config: The app config.
@@ -134,15 +134,15 @@ async def run_controller(
     # Add MCP tools to the agent
     if agent.config.enable_mcp:
         # Add OpenReplica' MCP server by default
-        openhands_mcp_server, openhands_mcp_stdio_servers = (
+        openreplica_mcp_server, openreplica_mcp_stdio_servers = (
             OpenReplicaMCPConfigImpl.create_default_mcp_server_config(
                 config.mcp_host, config, None
             )
         )
         # FIXME: OpenReplica' SSE server may not be running when headless mode is started
-        # if openhands_mcp_server:
-        #     config.mcp.sse_servers.append(openhands_mcp_server)
-        config.mcp.stdio_servers.extend(openhands_mcp_stdio_servers)
+        # if openreplica_mcp_server:
+        #     config.mcp.sse_servers.append(openreplica_mcp_server)
+        config.mcp.stdio_servers.extend(openreplica_mcp_stdio_servers)
 
         await add_mcp_tools_to_agent(agent, runtime, memory, config)
 
