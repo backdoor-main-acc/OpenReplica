@@ -1,38 +1,55 @@
-"""
-Runtime system for OpenReplica
-Handles code execution, Docker containers, and sandboxed environments
-"""
-from .base import Runtime, RuntimeConfig
-from .docker.runtime import DockerRuntime
-from .local.runtime import LocalRuntime
+from app.runtime.base import Runtime
+from app.runtime.impl.cli.cli_runtime import CLIRuntime
+from app.runtime.impl.daytona.daytona_runtime import DaytonaRuntime
+from app.runtime.impl.docker.docker_runtime import (
+    DockerRuntime,
+)
+from app.runtime.impl.e2b.e2b_runtime import E2BRuntime
+from app.runtime.impl.local.local_runtime import LocalRuntime
+from app.runtime.impl.modal.modal_runtime import ModalRuntime
+from app.runtime.impl.remote.remote_runtime import RemoteRuntime
+from app.runtime.impl.runloop.runloop_runtime import RunloopRuntime
+from app.utils.import_utils import get_impl
 
-# Runtime registry
-RUNTIME_REGISTRY = {
-    "docker": DockerRuntime,
-    "local": LocalRuntime,
+# mypy: disable-error-code="type-abstract"
+_DEFAULT_RUNTIME_CLASSES: dict[str, type[Runtime]] = {
+    'eventstream': DockerRuntime,
+    'docker': DockerRuntime,
+    'e2b': E2BRuntime,
+    'remote': RemoteRuntime,
+    'modal': ModalRuntime,
+    'runloop': RunloopRuntime,
+    'local': LocalRuntime,
+    'daytona': DaytonaRuntime,
+    'cli': CLIRuntime,
 }
 
 
-def create_runtime(runtime_type: str, config: RuntimeConfig) -> Runtime:
-    """Factory function to create runtime instances"""
-    if runtime_type not in RUNTIME_REGISTRY:
-        raise ValueError(f"Unknown runtime type: {runtime_type}")
-    
-    runtime_class = RUNTIME_REGISTRY[runtime_type]
-    return runtime_class(config)
-
-
-def get_available_runtimes() -> list[str]:
-    """Get list of available runtime types"""
-    return list(RUNTIME_REGISTRY.keys())
+def get_runtime_cls(name: str) -> type[Runtime]:
+    """
+    If name is one of the predefined runtime names (e.g. 'docker'), return its class.
+    Otherwise attempt to resolve name as subclass of Runtime and return it.
+    Raise on invalid selections.
+    """
+    if name in _DEFAULT_RUNTIME_CLASSES:
+        return _DEFAULT_RUNTIME_CLASSES[name]
+    try:
+        return get_impl(Runtime, name)
+    except Exception as e:
+        known_keys = _DEFAULT_RUNTIME_CLASSES.keys()
+        raise ValueError(
+            f'Runtime {name} not supported, known are: {known_keys}'
+        ) from e
 
 
 __all__ = [
-    "Runtime",
-    "RuntimeConfig",
-    "DockerRuntime", 
-    "LocalRuntime",
-    "create_runtime",
-    "get_available_runtimes",
-    "RUNTIME_REGISTRY"
+    'Runtime',
+    'E2BRuntime',
+    'RemoteRuntime',
+    'ModalRuntime',
+    'RunloopRuntime',
+    'DockerRuntime',
+    'DaytonaRuntime',
+    'CLIRuntime',
+    'get_runtime_cls',
 ]

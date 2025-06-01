@@ -1,7 +1,10 @@
 """
-Action execution server for OpenReplica runtime
-Runs inside containers and executes actions received from the backend
+This is the main file for the runtime client.
+It is responsible for executing actions received from OpenReplica backend and producing observations.
+
+NOTE: this will be executed inside the docker sandbox.
 """
+
 import argparse
 import asyncio
 import base64
@@ -18,39 +21,72 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from zipfile import ZipFile
 
+from binaryornot.check import is_binary
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import APIKeyHeader
+from mcpm import MCPRouter, RouterConfig
+from mcpm.router.router import logger as mcp_router_logger
+from openhands_aci.editor.editor import OHEditor
+from openhands_aci.editor.exceptions import ToolError
+from openhands_aci.editor.results import ToolResult
+from openhands_aci.utils.diff import get_diff
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from uvicorn import run
 
-from app.core.logger import get_logger
+from app.core.exceptions import BrowserUnavailableException
+from app.core.logger import openreplica_logger as logger
 from app.events.action import (
     Action,
+    BrowseInteractiveAction,
+    BrowseURLAction,
     CmdRunAction,
     FileEditAction,
     FileReadAction,
     FileWriteAction,
+    IPythonRunCellAction,
 )
+from app.events.event import FileEditSource, FileReadSource
 from app.events.observation import (
     CmdOutputObservation,
     ErrorObservation,
     FileEditObservation,
     FileReadObservation,
     FileWriteObservation,
+    IPythonRunCellObservation,
     Observation,
 )
 from app.events.serialization import event_from_dict, event_to_dict
+from app.runtime.browser import browse
+from app.runtime.browser.browser_env import BrowserEnv
+from app.runtime.file_viewer_server import start_file_viewer_server
+from app.runtime.plugins import ALL_PLUGINS, JupyterPlugin, Plugin, VSCodePlugin
+from app.runtime.utils import find_available_tcp_port
+from app.runtime.utils.async_bash import AsyncBashSession
+from app.runtime.utils.bash import BashSession
+from app.runtime.utils.files import insert_lines, read_lines
+from app.runtime.utils.log_capture import capture_logs
+from app.runtime.utils.memory_monitor import MemoryMonitor
+from app.runtime.utils.runtime_init import init_user_and_working_directory
+from app.runtime.utils.system_stats import get_system_stats
+from app.utils.async_utils import call_sync_from_async, wait_all
 
-logger = get_logger(__name__)
+# Set MCP router logger to the same level as the main logger
+mcp_router_logger.setLevel(logger.getEffectiveLevel())
+
+
+if sys.platform == 'win32':
+    from app.runtime.utils.windows_bash import WindowsPowershellSession
 
 
 class ActionRequest(BaseModel):
     action: dict
 
+
+ROOT_GID = 0
 
 SESSION_API_KEY = os.environ.get('SESSION_API_KEY')
 api_key_header = APIKeyHeader(name='X-Session-API-Key', auto_error=False)
@@ -62,383 +98,986 @@ def verify_api_key(api_key: str = Depends(api_key_header)):
     return api_key
 
 
-class ActionExecutionServer:
-    """Server that executes actions inside runtime containers"""
-    
-    def __init__(self, working_dir: str = "/workspace", api_key: str = None):
-        self.working_dir = working_dir
-        self.api_key = api_key
-        self.bash_session = None
-        self.jupyter_session = None
-        
-        # Ensure working directory exists
-        os.makedirs(working_dir, exist_ok=True)
-        os.chdir(working_dir)
-        
-        self.app = self._create_app()
-    
-    def _create_app(self) -> FastAPI:
-        """Create FastAPI application"""
-        
-        @asynccontextmanager
-        async def lifespan(app: FastAPI):
-            # Startup
-            logger.info(f"Action execution server starting in {self.working_dir}")
-            yield
-            # Shutdown
-            logger.info("Action execution server shutting down")
-        
-        app = FastAPI(
-            title="OpenReplica Action Execution Server",
-            lifespan=lifespan
+def _execute_file_editor(
+    editor: OHEditor,
+    command: str,
+    path: str,
+    file_text: str | None = None,
+    view_range: list[int] | None = None,
+    old_str: str | None = None,
+    new_str: str | None = None,
+    insert_line: int | str | None = None,
+    enable_linting: bool = False,
+) -> tuple[str, tuple[str | None, str | None]]:
+    """Execute file editor command and handle exceptions.
+
+    Args:
+        editor: The OHEditor instance
+        command: Editor command to execute
+        path: File path
+        file_text: Optional file text content
+        view_range: Optional view range tuple (start, end)
+        old_str: Optional string to replace
+        new_str: Optional replacement string
+        insert_line: Optional line number for insertion (can be int or str)
+        enable_linting: Whether to enable linting
+
+    Returns:
+        tuple: A tuple containing the output string and a tuple of old and new file content
+    """
+    result: ToolResult | None = None
+
+    # Convert insert_line from string to int if needed
+    if insert_line is not None and isinstance(insert_line, str):
+        try:
+            insert_line = int(insert_line)
+        except ValueError:
+            return (
+                f"ERROR:\nInvalid insert_line value: '{insert_line}'. Expected an integer.",
+                (None, None),
+            )
+
+    try:
+        result = editor(
+            command=command,
+            path=path,
+            file_text=file_text,
+            view_range=view_range,
+            old_str=old_str,
+            new_str=new_str,
+            insert_line=insert_line,
+            enable_linting=enable_linting,
         )
-        
-        @app.exception_handler(StarletteHTTPException)
-        async def http_exception_handler(request: Request, exc: StarletteHTTPException):
-            return JSONResponse(
-                status_code=exc.status_code,
-                content={"error": exc.detail}
+    except ToolError as e:
+        result = ToolResult(error=e.message)
+    except TypeError as e:
+        # Handle unexpected arguments or type errors
+        return f'ERROR:\n{str(e)}', (None, None)
+
+    if result.error:
+        return f'ERROR:\n{result.error}', (None, None)
+
+    if not result.output:
+        logger.warning(f'No output from file_editor for {path}')
+        return '', (None, None)
+
+    return result.output, (result.old_content, result.new_content)
+
+
+class ActionExecutor:
+    """ActionExecutor is running inside docker sandbox.
+    It is responsible for executing actions received from OpenReplica backend and producing observations.
+    """
+
+    def __init__(
+        self,
+        plugins_to_load: list[Plugin],
+        work_dir: str,
+        username: str,
+        user_id: int,
+        browsergym_eval_env: str | None,
+    ) -> None:
+        self.plugins_to_load = plugins_to_load
+        self._initial_cwd = work_dir
+        self.username = username
+        self.user_id = user_id
+        _updated_user_id = init_user_and_working_directory(
+            username=username, user_id=self.user_id, initial_cwd=work_dir
+        )
+        if _updated_user_id is not None:
+            self.user_id = _updated_user_id
+
+        self.bash_session: BashSession | 'WindowsPowershellSession' | None = None  # type: ignore[name-defined]
+        self.lock = asyncio.Lock()
+        self.plugins: dict[str, Plugin] = {}
+        self.file_editor = OHEditor(workspace_root=self._initial_cwd)
+        self.browser: BrowserEnv | None = None
+        self.browser_init_task: asyncio.Task | None = None
+        self.browsergym_eval_env = browsergym_eval_env
+
+        self.start_time = time.time()
+        self.last_execution_time = self.start_time
+        self._initialized = False
+
+        self.max_memory_gb: int | None = None
+        if _override_max_memory_gb := os.environ.get('RUNTIME_MAX_MEMORY_GB', None):
+            self.max_memory_gb = int(_override_max_memory_gb)
+            logger.info(
+                f'Setting max memory to {self.max_memory_gb}GB (according to the RUNTIME_MAX_MEMORY_GB environment variable)'
             )
-        
-        @app.exception_handler(RequestValidationError)
-        async def validation_exception_handler(request: Request, exc: RequestValidationError):
-            return JSONResponse(
-                status_code=422,
-                content={"error": "Validation error", "details": exc.errors()}
-            )
-        
-        @app.get("/")
-        async def root():
-            return {"status": "OpenReplica Action Execution Server"}
-        
-        @app.get("/health")
-        async def health():
-            return {
-                "status": "healthy",
-                "working_dir": self.working_dir,
-                "cwd": os.getcwd()
-            }
-        
-        @app.post("/execute_action")
-        async def execute_action(
-            request: ActionRequest,
-            api_key: str = Depends(verify_api_key)
-        ):
-            """Execute an action and return observation"""
-            try:
-                # Convert dict to action object
-                action = event_from_dict(request.action)
-                
-                # Execute the action
-                observation = await self._execute_action(action)
-                
-                # Convert observation back to dict
-                return event_to_dict(observation)
-                
-            except Exception as e:
-                logger.error(f"Error executing action: {e}")
-                traceback.print_exc()
-                return event_to_dict(ErrorObservation(
-                    content=str(e),
-                    message=f"Error executing action: {e}"
-                ))
-        
-        @app.get("/files")
-        async def list_files(path: str = "."):
-            """List files in directory"""
-            try:
-                full_path = os.path.join(self.working_dir, path)
-                if not os.path.exists(full_path):
-                    raise HTTPException(status_code=404, detail="Path not found")
-                
-                files = []
-                for item in os.listdir(full_path):
-                    item_path = os.path.join(full_path, item)
-                    stat = os.stat(item_path)
-                    files.append({
-                        "name": item,
-                        "is_directory": os.path.isdir(item_path),
-                        "size": stat.st_size,
-                        "modified": stat.st_mtime
-                    })
-                
-                return {"files": files}
-                
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=str(e))
-        
-        @app.get("/file/{path:path}")
-        async def read_file(path: str):
-            """Read file content"""
-            try:
-                full_path = os.path.join(self.working_dir, path)
-                if not os.path.exists(full_path):
-                    raise HTTPException(status_code=404, detail="File not found")
-                
-                if os.path.isdir(full_path):
-                    raise HTTPException(status_code=400, detail="Path is a directory")
-                
-                # Check if binary file
-                try:
-                    with open(full_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                    return {"content": content, "encoding": "utf-8"}
-                except UnicodeDecodeError:
-                    # Binary file, return base64 encoded
-                    with open(full_path, 'rb') as f:
-                        content = base64.b64encode(f.read()).decode('ascii')
-                    return {"content": content, "encoding": "base64"}
-                
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=str(e))
-        
-        @app.post("/file/{path:path}")
-        async def write_file(path: str, request: dict):
-            """Write file content"""
-            try:
-                full_path = os.path.join(self.working_dir, path)
-                content = request.get("content", "")
-                encoding = request.get("encoding", "utf-8")
-                
-                # Ensure directory exists
-                os.makedirs(os.path.dirname(full_path), exist_ok=True)
-                
-                if encoding == "base64":
-                    # Decode base64 content
-                    content_bytes = base64.b64decode(content)
-                    with open(full_path, 'wb') as f:
-                        f.write(content_bytes)
-                else:
-                    with open(full_path, 'w', encoding=encoding) as f:
-                        f.write(content)
-                
-                return {"success": True, "path": path}
-                
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=str(e))
-        
-        @app.delete("/file/{path:path}")
-        async def delete_file(path: str):
-            """Delete file or directory"""
-            try:
-                full_path = os.path.join(self.working_dir, path)
-                if not os.path.exists(full_path):
-                    raise HTTPException(status_code=404, detail="Path not found")
-                
-                if os.path.isdir(full_path):
-                    shutil.rmtree(full_path)
-                else:
-                    os.remove(full_path)
-                
-                return {"success": True, "path": path}
-                
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=str(e))
-        
-        @app.post("/upload")
-        async def upload_file(file: UploadFile, path: str = ""):
-            """Upload file to container"""
-            try:
-                upload_path = os.path.join(self.working_dir, path, file.filename)
-                os.makedirs(os.path.dirname(upload_path), exist_ok=True)
-                
-                with open(upload_path, 'wb') as f:
-                    content = await file.read()
-                    f.write(content)
-                
-                return {"success": True, "path": upload_path, "filename": file.filename}
-                
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=str(e))
-        
-        return app
-    
-    async def _execute_action(self, action: Action) -> Observation:
-        """Execute an action and return observation"""
-        
-        if isinstance(action, CmdRunAction):
-            return await self._execute_cmd_action(action)
-        elif isinstance(action, FileReadAction):
-            return await self._execute_file_read_action(action)
-        elif isinstance(action, FileWriteAction):
-            return await self._execute_file_write_action(action)
-        elif isinstance(action, FileEditAction):
-            return await self._execute_file_edit_action(action)
         else:
-            return ErrorObservation(
-                content=f"Unsupported action type: {type(action).__name__}",
-                message=f"Action type {type(action).__name__} is not supported"
-            )
-    
-    async def _execute_cmd_action(self, action: CmdRunAction) -> CmdOutputObservation:
-        """Execute command action"""
+            logger.info('No max memory limit set, using all available system memory')
+
+        self.memory_monitor = MemoryMonitor(
+            enable=os.environ.get('RUNTIME_MEMORY_MONITOR', 'False').lower()
+            in ['true', '1', 'yes']
+        )
+        self.memory_monitor.start_monitoring()
+
+    @property
+    def initial_cwd(self):
+        return self._initial_cwd
+
+    async def _init_browser_async(self):
+        """Initialize the browser asynchronously."""
+        if sys.platform == 'win32':
+            logger.warning('Browser environment not supported on windows')
+            return
+
+        logger.debug('Initializing browser asynchronously')
         try:
-            # Initialize bash session if needed
-            if self.bash_session is None:
-                from app.runtime.utils.bash import BashSession
-                self.bash_session = BashSession()
-            
-            # Execute command
-            exit_code, output = self.bash_session.execute(action.command)
-            
-            return CmdOutputObservation(
-                content=output,
-                command=action.command,
-                exit_code=exit_code
-            )
-            
+            self.browser = BrowserEnv(self.browsergym_eval_env)
+            logger.debug('Browser initialized asynchronously')
         except Exception as e:
-            return CmdOutputObservation(
-                content=str(e),
-                command=action.command,
-                exit_code=-1
+            logger.error(f'Failed to initialize browser: {e}')
+            self.browser = None
+
+    async def _ensure_browser_ready(self):
+        """Ensure the browser is ready for use."""
+        if self.browser is None:
+            if self.browser_init_task is None:
+                # Start browser initialization if it hasn't been started
+                self.browser_init_task = asyncio.create_task(self._init_browser_async())
+            elif self.browser_init_task.done():
+                # If the task is done but browser is still None, restart initialization
+                self.browser_init_task = asyncio.create_task(self._init_browser_async())
+
+            # Wait for browser to be initialized
+            if self.browser_init_task:
+                logger.debug('Waiting for browser to be ready...')
+                await self.browser_init_task
+
+            # Check if browser was successfully initialized
+            if self.browser is None:
+                raise BrowserUnavailableException('Browser initialization failed')
+
+        # If we get here, the browser is ready
+        logger.debug('Browser is ready')
+
+    async def ainit(self):
+        # bash needs to be initialized first
+        logger.debug('Initializing bash session')
+        if sys.platform == 'win32':
+            self.bash_session = WindowsPowershellSession(  # type: ignore[name-defined]
+                work_dir=self._initial_cwd,
+                username=self.username,
+                no_change_timeout_seconds=int(
+                    os.environ.get('NO_CHANGE_TIMEOUT_SECONDS', 10)
+                ),
+                max_memory_mb=self.max_memory_gb * 1024 if self.max_memory_gb else None,
             )
-    
-    async def _execute_file_read_action(self, action: FileReadAction) -> FileReadObservation:
-        """Execute file read action"""
-        try:
-            file_path = os.path.join(self.working_dir, action.path)
-            
-            if not os.path.exists(file_path):
-                return FileReadObservation(
-                    content="",
-                    path=action.path,
-                    error=f"File not found: {action.path}"
+        else:
+            self.bash_session = BashSession(
+                work_dir=self._initial_cwd,
+                username=self.username,
+                no_change_timeout_seconds=int(
+                    os.environ.get('NO_CHANGE_TIMEOUT_SECONDS', 10)
+                ),
+                max_memory_mb=self.max_memory_gb * 1024 if self.max_memory_gb else None,
+            )
+            self.bash_session.initialize()
+        logger.debug('Bash session initialized')
+
+        # Start browser initialization in the background
+        self.browser_init_task = asyncio.create_task(self._init_browser_async())
+        logger.debug('Browser initialization started in background')
+
+        await wait_all(
+            (self._init_plugin(plugin) for plugin in self.plugins_to_load),
+            timeout=60,
+        )
+        logger.debug('All plugins initialized')
+
+        # This is a temporary workaround
+        # TODO: refactor AgentSkills to be part of JupyterPlugin
+        # AFTER ServerRuntime is deprecated
+        logger.debug('Initializing AgentSkills')
+        if 'agent_skills' in self.plugins and 'jupyter' in self.plugins:
+            obs = await self.run_ipython(
+                IPythonRunCellAction(
+                    code='from app.runtime.plugins.agent_skills.agentskills import *\n'
                 )
-            
-            # Read file content
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-            except UnicodeDecodeError:
-                # Try with different encodings
-                for encoding in ['latin-1', 'cp1252']:
-                    try:
-                        with open(file_path, 'r', encoding=encoding) as f:
-                            content = f.read()
-                        break
-                    except UnicodeDecodeError:
-                        continue
-                else:
-                    # Read as binary and decode with errors='replace'
-                    with open(file_path, 'rb') as f:
-                        content = f.read().decode('utf-8', errors='replace')
-            
-            return FileReadObservation(
-                content=content,
-                path=action.path
             )
-            
-        except Exception as e:
-            return FileReadObservation(
-                content="",
-                path=action.path,
-                error=str(e)
+            logger.debug(f'AgentSkills initialized: {obs}')
+
+        logger.debug('Initializing bash commands')
+        await self._init_bash_commands()
+
+        logger.debug('Runtime client initialized.')
+        self._initialized = True
+
+    @property
+    def initialized(self) -> bool:
+        return self._initialized
+
+    async def _init_plugin(self, plugin: Plugin):
+        assert self.bash_session is not None
+        await plugin.initialize(self.username)
+        self.plugins[plugin.name] = plugin
+        logger.debug(f'Initializing plugin: {plugin.name}')
+
+        if isinstance(plugin, JupyterPlugin):
+            # Escape backslashes in Windows path
+            cwd = self.bash_session.cwd.replace('\\', '/')
+            await self.run_ipython(
+                IPythonRunCellAction(code=f'import os; os.chdir(r"{cwd}")')
             )
-    
-    async def _execute_file_write_action(self, action: FileWriteAction) -> FileWriteObservation:
-        """Execute file write action"""
-        try:
-            file_path = os.path.join(self.working_dir, action.path)
-            
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            
-            # Write file content
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(action.content)
-            
-            return FileWriteObservation(
-                content=f"File written successfully: {action.path}",
-                path=action.path
-            )
-            
-        except Exception as e:
-            return FileWriteObservation(
-                content=f"Error writing file: {e}",
-                path=action.path,
-                error=str(e)
-            )
-    
-    async def _execute_file_edit_action(self, action: FileEditAction) -> FileEditObservation:
-        """Execute file edit action"""
-        try:
-            file_path = os.path.join(self.working_dir, action.path)
-            
-            if not os.path.exists(file_path):
-                return FileEditObservation(
-                    content=f"File not found: {action.path}",
-                    path=action.path,
-                    error=f"File not found: {action.path}"
+
+    async def _init_bash_commands(self):
+        INIT_COMMANDS = []
+        is_local_runtime = os.environ.get('LOCAL_RUNTIME_MODE') == '1'
+        is_windows = sys.platform == 'win32'
+
+        # Determine git config commands based on platform and runtime mode
+        if is_local_runtime:
+            if is_windows:
+                # Windows, local - split into separate commands
+                INIT_COMMANDS.append(
+                    'git config --file ./.git_config user.name "openhands"'
                 )
-            
-            # Read current content
-            with open(file_path, 'r', encoding='utf-8') as f:
-                current_content = f.read()
-            
-            # Apply edit based on edit type
-            if hasattr(action, 'new_str') and hasattr(action, 'old_str'):
-                # String replacement
-                if action.old_str in current_content:
-                    new_content = current_content.replace(action.old_str, action.new_str)
-                else:
-                    return FileEditObservation(
-                        content=f"String not found in file: {action.old_str}",
-                        path=action.path,
-                        error=f"String not found: {action.old_str}"
-                    )
+                INIT_COMMANDS.append(
+                    'git config --file ./.git_config user.email "openhands@all-hands.dev"'
+                )
+                INIT_COMMANDS.append(
+                    '$env:GIT_CONFIG = (Join-Path (Get-Location) ".git_config")'
+                )
             else:
-                # Full content replacement
-                new_content = getattr(action, 'content', current_content)
-            
-            # Write new content
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(new_content)
-            
-            return FileEditObservation(
-                content=f"File edited successfully: {action.path}",
-                path=action.path
+                # Linux/macOS, local
+                base_git_config = (
+                    'git config --file ./.git_config user.name "openhands" && '
+                    'git config --file ./.git_config user.email "openhands@all-hands.dev" && '
+                    'export GIT_CONFIG=$(pwd)/.git_config'
+                )
+                INIT_COMMANDS.append(base_git_config)
+        else:
+            # Non-local (implies Linux/macOS)
+            base_git_config = (
+                'git config --global user.name "openhands" && '
+                'git config --global user.email "openhands@all-hands.dev"'
             )
-            
+            INIT_COMMANDS.append(base_git_config)
+
+        # Determine no-pager command
+        if is_windows:
+            no_pager_cmd = 'function git { git.exe --no-pager $args }'
+        else:
+            no_pager_cmd = 'alias git="git --no-pager"'
+
+        INIT_COMMANDS.append(no_pager_cmd)
+
+        logger.info(f'Initializing by running {len(INIT_COMMANDS)} bash commands...')
+        for command in INIT_COMMANDS:
+            action = CmdRunAction(command=command)
+            action.set_hard_timeout(300)
+            logger.debug(f'Executing init command: {command}')
+            obs = await self.run(action)
+            assert isinstance(obs, CmdOutputObservation)
+            logger.debug(
+                f'Init command outputs (exit code: {obs.exit_code}): {obs.content}'
+            )
+            assert obs.exit_code == 0
+        logger.debug('Bash init commands completed')
+
+    async def run_action(self, action) -> Observation:
+        async with self.lock:
+            action_type = action.action
+            observation = await getattr(self, action_type)(action)
+            return observation
+
+    async def run(
+        self, action: CmdRunAction
+    ) -> CmdOutputObservation | ErrorObservation:
+        try:
+            if action.is_static:
+                path = action.cwd or self._initial_cwd
+                result = await AsyncBashSession.execute(action.command, path)
+                obs = CmdOutputObservation(
+                    content=result.content,
+                    exit_code=result.exit_code,
+                    command=action.command,
+                )
+                return obs
+
+            assert self.bash_session is not None
+            obs = await call_sync_from_async(self.bash_session.execute, action)
+            return obs
         except Exception as e:
-            return FileEditObservation(
-                content=f"Error editing file: {e}",
-                path=action.path,
-                error=str(e)
+            logger.error(f'Error running command: {e}')
+            return ErrorObservation(str(e))
+
+    async def run_ipython(self, action: IPythonRunCellAction) -> Observation:
+        assert self.bash_session is not None
+        if 'jupyter' in self.plugins:
+            _jupyter_plugin: JupyterPlugin = self.plugins['jupyter']  # type: ignore
+            # This is used to make AgentSkills in Jupyter aware of the
+            # current working directory in Bash
+            jupyter_cwd = getattr(self, '_jupyter_cwd', None)
+            if self.bash_session.cwd != jupyter_cwd:
+                logger.debug(
+                    f'{self.bash_session.cwd} != {jupyter_cwd} -> reset Jupyter PWD'
+                )
+                # escape windows paths
+                cwd = self.bash_session.cwd.replace('\\', '/')
+                reset_jupyter_cwd_code = f'import os; os.chdir("{cwd}")'
+                _aux_action = IPythonRunCellAction(code=reset_jupyter_cwd_code)
+                _reset_obs: IPythonRunCellObservation = await _jupyter_plugin.run(
+                    _aux_action
+                )
+                logger.debug(
+                    f'Changed working directory in IPython to: {self.bash_session.cwd}. Output: {_reset_obs}'
+                )
+                self._jupyter_cwd = self.bash_session.cwd
+
+            obs: IPythonRunCellObservation = await _jupyter_plugin.run(action)
+            obs.content = obs.content.rstrip()
+
+            if action.include_extra:
+                obs.content += (
+                    f'\n[Jupyter current working directory: {self.bash_session.cwd}]'
+                )
+                obs.content += f'\n[Jupyter Python interpreter: {_jupyter_plugin.python_interpreter_path}]'
+            return obs
+        else:
+            raise RuntimeError(
+                'JupyterRequirement not found. Unable to run IPython action.'
             )
 
+    def _resolve_path(self, path: str, working_dir: str) -> str:
+        filepath = Path(path)
+        if not filepath.is_absolute():
+            return str(Path(working_dir) / filepath)
+        return str(filepath)
 
-def main():
-    """Main entry point for action execution server"""
-    parser = argparse.ArgumentParser(description="OpenReplica Action Execution Server")
-    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
-    parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
-    parser.add_argument("--working-dir", default="/workspace", help="Working directory")
-    parser.add_argument("--api-key", help="API key for authentication")
-    parser.add_argument("--log-level", default="INFO", help="Log level")
-    
+    async def read(self, action: FileReadAction) -> Observation:
+        assert self.bash_session is not None
+
+        # Cannot read binary files
+        if is_binary(action.path):
+            return ErrorObservation('ERROR_BINARY_FILE')
+
+        if action.impl_source == FileReadSource.OH_ACI:
+            result_str, _ = _execute_file_editor(
+                self.file_editor,
+                command='view',
+                path=action.path,
+                view_range=action.view_range,
+            )
+
+            return FileReadObservation(
+                content=result_str,
+                path=action.path,
+                impl_source=FileReadSource.OH_ACI,
+            )
+
+        # NOTE: the client code is running inside the sandbox,
+        # so there's no need to check permission
+        working_dir = self.bash_session.cwd
+        filepath = self._resolve_path(action.path, working_dir)
+        try:
+            if filepath.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
+                with open(filepath, 'rb') as file:  # noqa: ASYNC101
+                    image_data = file.read()
+                    encoded_image = base64.b64encode(image_data).decode('utf-8')
+                    mime_type, _ = mimetypes.guess_type(filepath)
+                    if mime_type is None:
+                        mime_type = 'image/png'  # default to PNG if mime type cannot be determined
+                    encoded_image = f'data:{mime_type};base64,{encoded_image}'
+
+                return FileReadObservation(path=filepath, content=encoded_image)
+            elif filepath.lower().endswith('.pdf'):
+                with open(filepath, 'rb') as file:  # noqa: ASYNC101
+                    pdf_data = file.read()
+                    encoded_pdf = base64.b64encode(pdf_data).decode('utf-8')
+                    encoded_pdf = f'data:application/pdf;base64,{encoded_pdf}'
+                return FileReadObservation(path=filepath, content=encoded_pdf)
+            elif filepath.lower().endswith(('.mp4', '.webm', '.ogg')):
+                with open(filepath, 'rb') as file:  # noqa: ASYNC101
+                    video_data = file.read()
+                    encoded_video = base64.b64encode(video_data).decode('utf-8')
+                    mime_type, _ = mimetypes.guess_type(filepath)
+                    if mime_type is None:
+                        mime_type = 'video/mp4'  # default to MP4 if MIME type cannot be determined
+                    encoded_video = f'data:{mime_type};base64,{encoded_video}'
+
+                return FileReadObservation(path=filepath, content=encoded_video)
+
+            with open(filepath, 'r', encoding='utf-8') as file:  # noqa: ASYNC101
+                lines = read_lines(file.readlines(), action.start, action.end)
+        except FileNotFoundError:
+            return ErrorObservation(
+                f'File not found: {filepath}. Your current working directory is {working_dir}.'
+            )
+        except UnicodeDecodeError:
+            return ErrorObservation(f'File could not be decoded as utf-8: {filepath}.')
+        except IsADirectoryError:
+            return ErrorObservation(
+                f'Path is a directory: {filepath}. You can only read files'
+            )
+
+        code_view = ''.join(lines)
+        return FileReadObservation(path=filepath, content=code_view)
+
+    async def write(self, action: FileWriteAction) -> Observation:
+        assert self.bash_session is not None
+        working_dir = self.bash_session.cwd
+        filepath = self._resolve_path(action.path, working_dir)
+
+        insert = action.content.split('\n')
+        if not os.path.exists(os.path.dirname(filepath)):
+            os.makedirs(os.path.dirname(filepath))
+
+        file_exists = os.path.exists(filepath)
+        if file_exists:
+            file_stat = os.stat(filepath)
+        else:
+            file_stat = None
+
+        mode = 'w' if not file_exists else 'r+'
+        try:
+            with open(filepath, mode, encoding='utf-8') as file:  # noqa: ASYNC101
+                if mode != 'w':
+                    all_lines = file.readlines()
+                    new_file = insert_lines(insert, all_lines, action.start, action.end)
+                else:
+                    new_file = [i + '\n' for i in insert]
+
+                file.seek(0)
+                file.writelines(new_file)
+                file.truncate()
+
+        except FileNotFoundError:
+            return ErrorObservation(f'File not found: {filepath}')
+        except IsADirectoryError:
+            return ErrorObservation(
+                f'Path is a directory: {filepath}. You can only write to files'
+            )
+        except UnicodeDecodeError:
+            return ErrorObservation(f'File could not be decoded as utf-8: {filepath}')
+
+        # Attempt to handle file permissions
+        try:
+            if file_exists:
+                assert file_stat is not None
+                # restore the original file permissions if the file already exists
+                os.chmod(filepath, file_stat.st_mode)
+                os.chown(filepath, file_stat.st_uid, file_stat.st_gid)
+            else:
+                # set the new file permissions if the file is new
+                os.chmod(filepath, 0o664)
+                os.chown(filepath, self.user_id, self.user_id)
+        except PermissionError as e:
+            return ErrorObservation(
+                f'File {filepath} written, but failed to change ownership and permissions: {e}'
+            )
+        return FileWriteObservation(content='', path=filepath)
+
+    async def edit(self, action: FileEditAction) -> Observation:
+        assert action.impl_source == FileEditSource.OH_ACI
+        result_str, (old_content, new_content) = _execute_file_editor(
+            self.file_editor,
+            command=action.command,
+            path=action.path,
+            file_text=action.file_text,
+            old_str=action.old_str,
+            new_str=action.new_str,
+            insert_line=action.insert_line,
+            enable_linting=False,
+        )
+
+        return FileEditObservation(
+            content=result_str,
+            path=action.path,
+            old_content=action.old_str,
+            new_content=action.new_str,
+            impl_source=FileEditSource.OH_ACI,
+            diff=get_diff(
+                old_contents=old_content or '',
+                new_contents=new_content or '',
+                filepath=action.path,
+            ),
+        )
+
+    async def browse(self, action: BrowseURLAction) -> Observation:
+        if self.browser is None:
+            return ErrorObservation(
+                'Browser functionality is not supported on Windows.'
+            )
+        await self._ensure_browser_ready()
+        return await browse(action, self.browser, self.initial_cwd)
+
+    async def browse_interactive(self, action: BrowseInteractiveAction) -> Observation:
+        if self.browser is None:
+            return ErrorObservation(
+                'Browser functionality is not supported on Windows.'
+            )
+        await self._ensure_browser_ready()
+        return await browse(action, self.browser, self.initial_cwd)
+
+    def close(self):
+        self.memory_monitor.stop_monitoring()
+        if self.bash_session is not None:
+            self.bash_session.close()
+        if self.browser is not None:
+            self.browser.close()
+
+
+if __name__ == '__main__':
+    logger.warning('Starting Action Execution Server')
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('port', type=int, help='Port to listen on')
+    parser.add_argument('--working-dir', type=str, help='Working directory')
+    parser.add_argument('--plugins', type=str, help='Plugins to initialize', nargs='+')
+    parser.add_argument(
+        '--username', type=str, help='User to run as', default='openhands'
+    )
+    parser.add_argument('--user-id', type=int, help='User ID to run as', default=1000)
+    parser.add_argument(
+        '--browsergym-eval-env',
+        type=str,
+        help='BrowserGym environment used for browser evaluation',
+        default=None,
+    )
+
+    # example: python client.py 8000 --working-dir /workspace --plugins JupyterRequirement
     args = parser.parse_args()
-    
-    # Setup logging
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper()),
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+
+    # Start the file viewer server in a separate thread
+    logger.info('Starting file viewer server')
+    _file_viewer_port = find_available_tcp_port(
+        min_port=args.port + 1, max_port=min(args.port + 1024, 65535)
     )
-    
-    # Create server
-    server = ActionExecutionServer(
-        working_dir=args.working_dir,
-        api_key=args.api_key
-    )
-    
-    # Run server
-    run(
-        server.app,
-        host=args.host,
-        port=args.port,
-        log_level=args.log_level.lower()
+    server_url, _ = start_file_viewer_server(port=_file_viewer_port)
+    logger.info(f'File viewer server started at {server_url}')
+
+    plugins_to_load: list[Plugin] = []
+    if args.plugins:
+        for plugin in args.plugins:
+            if plugin not in ALL_PLUGINS:
+                raise ValueError(f'Plugin {plugin} not found')
+            plugins_to_load.append(ALL_PLUGINS[plugin]())  # type: ignore
+
+    client: ActionExecutor | None = None
+    mcp_router: MCPRouter | None = None
+    MCP_ROUTER_PROFILE_PATH = os.path.join(
+        os.path.dirname(__file__), 'mcp', 'config.json'
     )
 
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        global client, mcp_router
+        logger.info('Initializing ActionExecutor...')
+        client = ActionExecutor(
+            plugins_to_load,
+            work_dir=args.working_dir,
+            username=args.username,
+            user_id=args.user_id,
+            browsergym_eval_env=args.browsergym_eval_env,
+        )
+        await client.ainit()
+        logger.info('ActionExecutor initialized.')
 
-if __name__ == "__main__":
-    main()
+        # Check if we're on Windows
+        is_windows = sys.platform == 'win32'
+
+        # Initialize and mount MCP Router (skip on Windows)
+        if is_windows:
+            logger.info('Skipping MCP Router initialization on Windows')
+            mcp_router = None
+        else:
+            logger.info('Initializing MCP Router...')
+            mcp_router = MCPRouter(
+                profile_path=MCP_ROUTER_PROFILE_PATH,
+                router_config=RouterConfig(
+                    api_key=SESSION_API_KEY,
+                    auth_enabled=bool(SESSION_API_KEY),
+                ),
+            )
+            allowed_origins = ['*']
+            sse_app = await mcp_router.get_sse_server_app(
+                allow_origins=allowed_origins, include_lifespan=False
+            )
+
+        # Only mount SSE app if MCP Router is initialized (not on Windows)
+        if mcp_router is not None:
+            # Check for route conflicts before mounting
+            main_app_routes = {route.path for route in app.routes}
+            sse_app_routes = {route.path for route in sse_app.routes}
+            conflicting_routes = main_app_routes.intersection(sse_app_routes)
+
+            if conflicting_routes:
+                logger.error(f'Route conflicts detected: {conflicting_routes}')
+                raise RuntimeError(
+                    f'Cannot mount SSE app - conflicting routes found: {conflicting_routes}'
+                )
+
+            app.mount('/', sse_app)
+            logger.info(
+                f'Mounted MCP Router SSE app at root path with allowed origins: {allowed_origins}'
+            )
+
+            # Additional debug logging
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug('Main app routes:')
+                for route in main_app_routes:
+                    logger.debug(f'  {route}')
+                logger.debug('MCP SSE server app routes:')
+                for route in sse_app_routes:
+                    logger.debug(f'  {route}')
+
+        yield
+
+        # Clean up & release the resources
+        logger.info('Shutting down MCP Router...')
+        if mcp_router:
+            try:
+                await mcp_router.shutdown()
+                logger.info('MCP Router shutdown successfully.')
+            except Exception as e:
+                logger.error(f'Error shutting down MCP Router: {e}', exc_info=True)
+        else:
+            logger.info('MCP Router instance not found for shutdown.')
+
+        logger.info('Closing ActionExecutor...')
+        if client:
+            try:
+                client.close()
+                logger.info('ActionExecutor closed successfully.')
+            except Exception as e:
+                logger.error(f'Error closing ActionExecutor: {e}', exc_info=True)
+        else:
+            logger.info('ActionExecutor instance not found for closing.')
+        logger.info('Shutdown complete.')
+
+    app = FastAPI(lifespan=lifespan)
+
+    # TODO below 3 exception handlers were recommended by Sonnet.
+    # Are these something we should keep?
+    @app.exception_handler(Exception)
+    async def global_exception_handler(request: Request, exc: Exception):
+        logger.exception('Unhandled exception occurred:')
+        return JSONResponse(
+            status_code=500,
+            content={'detail': 'An unexpected error occurred. Please try again later.'},
+        )
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+        logger.error(f'HTTP exception occurred: {exc.detail}')
+        return JSONResponse(status_code=exc.status_code, content={'detail': exc.detail})
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(
+        request: Request, exc: RequestValidationError
+    ):
+        logger.error(f'Validation error occurred: {exc}')
+        return JSONResponse(
+            status_code=422,
+            content={
+                'detail': 'Invalid request parameters',
+                'errors': str(exc.errors()),
+            },
+        )
+
+    @app.middleware('http')
+    async def authenticate_requests(request: Request, call_next):
+        if request.url.path != '/alive' and request.url.path != '/server_info':
+            try:
+                verify_api_key(request.headers.get('X-Session-API-Key'))
+            except HTTPException as e:
+                return JSONResponse(
+                    status_code=e.status_code, content={'detail': e.detail}
+                )
+        response = await call_next(request)
+        return response
+
+    @app.get('/server_info')
+    async def get_server_info():
+        assert client is not None
+        current_time = time.time()
+        uptime = current_time - client.start_time
+        idle_time = current_time - client.last_execution_time
+
+        response = {
+            'uptime': uptime,
+            'idle_time': idle_time,
+            'resources': get_system_stats(),
+        }
+        logger.info('Server info endpoint response: %s', response)
+        return response
+
+    @app.post('/execute_action')
+    async def execute_action(action_request: ActionRequest):
+        assert client is not None
+        try:
+            action = event_from_dict(action_request.action)
+            if not isinstance(action, Action):
+                raise HTTPException(status_code=400, detail='Invalid action type')
+            client.last_execution_time = time.time()
+            observation = await client.run_action(action)
+            return event_to_dict(observation)
+        except Exception as e:
+            logger.error(f'Error while running /execute_action: {str(e)}')
+            raise HTTPException(
+                status_code=500,
+                detail=traceback.format_exc(),
+            )
+
+    @app.post('/update_mcp_server')
+    async def update_mcp_server(request: Request):
+        # Check if we're on Windows
+        is_windows = sys.platform == 'win32'
+
+        if is_windows:
+            # On Windows, just return a success response without doing anything
+            logger.info(
+                'MCP server update request received on Windows - skipping as MCP is disabled'
+            )
+            return JSONResponse(
+                status_code=200,
+                content={
+                    'detail': 'MCP server update skipped (MCP is disabled on Windows)',
+                    'router_error_log': '',
+                },
+            )
+
+        # Non-Windows implementation
+        assert mcp_router is not None
+        assert os.path.exists(MCP_ROUTER_PROFILE_PATH)
+
+        # Use synchronous file operations outside of async function
+        def read_profile():
+            with open(MCP_ROUTER_PROFILE_PATH, 'r') as f:
+                return json.load(f)
+
+        current_profile = read_profile()
+        assert 'default' in current_profile
+        assert isinstance(current_profile['default'], list)
+
+        # Get the request body
+        mcp_tools_to_sync = await request.json()
+        if not isinstance(mcp_tools_to_sync, list):
+            raise HTTPException(
+                status_code=400, detail='Request must be a list of MCP tools to sync'
+            )
+
+        logger.info(
+            f'Updating MCP server to: {json.dumps(mcp_tools_to_sync, indent=2)}.\nPrevious profile: {json.dumps(current_profile, indent=2)}'
+        )
+        current_profile['default'] = mcp_tools_to_sync
+
+        # Use synchronous file operations outside of async function
+        def write_profile(profile):
+            with open(MCP_ROUTER_PROFILE_PATH, 'w') as f:
+                json.dump(profile, f)
+
+        write_profile(current_profile)
+
+        # Manually reload the profile and update the servers
+        mcp_router.profile_manager.reload()
+        servers_wait_for_update = mcp_router.get_unique_servers()
+        async with capture_logs('mcpm.router.router') as log_capture:
+            await mcp_router.update_servers(servers_wait_for_update)
+        router_error_log = log_capture.getvalue()
+
+        logger.info(
+            f'MCP router updated successfully with unique servers: {servers_wait_for_update}'
+        )
+        if router_error_log:
+            logger.warning(f'Some MCP servers failed to be added: {router_error_log}')
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                'detail': 'MCP server updated successfully',
+                'router_error_log': router_error_log,
+            },
+        )
+
+    @app.post('/upload_file')
+    async def upload_file(
+        file: UploadFile, destination: str = '/', recursive: bool = False
+    ):
+        assert client is not None
+
+        try:
+            # Ensure the destination directory exists
+            if not os.path.isabs(destination):
+                raise HTTPException(
+                    status_code=400, detail='Destination must be an absolute path'
+                )
+
+            full_dest_path = destination
+            if not os.path.exists(full_dest_path):
+                os.makedirs(full_dest_path, exist_ok=True)
+
+            if recursive or file.filename.endswith('.zip'):
+                # For recursive uploads, we expect a zip file
+                if not file.filename.endswith('.zip'):
+                    raise HTTPException(
+                        status_code=400, detail='Recursive uploads must be zip files'
+                    )
+
+                zip_path = os.path.join(full_dest_path, file.filename)
+                with open(zip_path, 'wb') as buffer:  # noqa: ASYNC101
+                    shutil.copyfileobj(file.file, buffer)
+
+                # Extract the zip file
+                shutil.unpack_archive(zip_path, full_dest_path)
+                os.remove(zip_path)  # Remove the zip file after extraction
+
+                logger.debug(
+                    f'Uploaded file {file.filename} and extracted to {destination}'
+                )
+            else:
+                # For single file uploads
+                file_path = os.path.join(full_dest_path, file.filename)
+                with open(file_path, 'wb') as buffer:  # noqa: ASYNC101
+                    shutil.copyfileobj(file.file, buffer)
+                logger.debug(f'Uploaded file {file.filename} to {destination}')
+
+            return JSONResponse(
+                content={
+                    'filename': file.filename,
+                    'destination': destination,
+                    'recursive': recursive,
+                },
+                status_code=200,
+            )
+
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get('/download_files')
+    def download_file(path: str):
+        logger.debug('Downloading files')
+        try:
+            if not os.path.isabs(path):
+                raise HTTPException(
+                    status_code=400, detail='Path must be an absolute path'
+                )
+
+            if not os.path.exists(path):
+                raise HTTPException(status_code=404, detail='File not found')
+
+            with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as temp_zip:
+                with ZipFile(temp_zip, 'w') as zipf:
+                    for root, _, files in os.walk(path):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            zipf.write(
+                                file_path, arcname=os.path.relpath(file_path, path)
+                            )
+                return FileResponse(
+                    path=temp_zip.name,
+                    media_type='application/zip',
+                    filename=f'{os.path.basename(path)}.zip',
+                    background=BackgroundTask(lambda: os.unlink(temp_zip.name)),
+                )
+
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get('/alive')
+    async def alive():
+        if client is None or not client.initialized:
+            return {'status': 'not initialized'}
+        return {'status': 'ok'}
+
+    # ================================
+    # VSCode-specific operations
+    # ================================
+
+    @app.get('/vscode/connection_token')
+    async def get_vscode_connection_token():
+        assert client is not None
+        if 'vscode' in client.plugins:
+            plugin: VSCodePlugin = client.plugins['vscode']  # type: ignore
+            return {'token': plugin.vscode_connection_token}
+        else:
+            return {'token': None}
+
+    # ================================
+    # File-specific operations for UI
+    # ================================
+
+    @app.post('/list_files')
+    async def list_files(request: Request):
+        """List files in the specified path.
+
+        This function retrieves a list of files from the agent's runtime file store,
+        excluding certain system and hidden files/directories.
+
+        To list files:
+        ```sh
+        curl -X POST -d '{"path": "/"}' http://localhost:3000/list_files
+        ```
+
+        Args:
+            request (Request): The incoming request object.
+            path (str, optional): The path to list files from. Defaults to '/'.
+
+        Returns:
+            list: A list of file names in the specified path.
+
+        Raises:
+            HTTPException: If there's an error listing the files.
+        """
+        assert client is not None
+
+        # get request as dict
+        request_dict = await request.json()
+        path = request_dict.get('path', None)
+
+        # Get the full path of the requested directory
+        if path is None:
+            full_path = client.initial_cwd
+        elif os.path.isabs(path):
+            full_path = path
+        else:
+            full_path = os.path.join(client.initial_cwd, path)
+
+        if not os.path.exists(full_path):
+            # if user just removed a folder, prevent server error 500 in UI
+            return JSONResponse(content=[])
+
+        try:
+            # Check if the directory exists
+            if not os.path.exists(full_path) or not os.path.isdir(full_path):
+                return JSONResponse(content=[])
+
+            entries = os.listdir(full_path)
+
+            # Separate directories and files
+            directories = []
+            files = []
+            for entry in entries:
+                # Remove leading slash and any parent directory components
+                entry_relative = entry.lstrip('/').split('/')[-1]
+
+                # Construct the full path by joining the base path with the relative entry path
+                full_entry_path = os.path.join(full_path, entry_relative)
+                if os.path.exists(full_entry_path):
+                    is_dir = os.path.isdir(full_entry_path)
+                    if is_dir:
+                        # add trailing slash to directories
+                        # required by FE to differentiate directories and files
+                        entry = entry.rstrip('/') + '/'
+                        directories.append(entry)
+                    else:
+                        files.append(entry)
+
+            # Sort directories and files separately
+            directories.sort(key=lambda s: s.lower())
+            files.sort(key=lambda s: s.lower())
+
+            # Combine sorted directories and files
+            sorted_entries = directories + files
+            return JSONResponse(content=sorted_entries)
+
+        except Exception as e:
+            logger.error(f'Error listing files: {e}')
+            return JSONResponse(content=[])
+
+    logger.debug(f'Starting action execution API on port {args.port}')
+    run(app, host='0.0.0.0', port=args.port)

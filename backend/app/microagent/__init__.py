@@ -1,6 +1,3 @@
-"""
-Microagent system for OpenReplica matching OpenHands exactly
-"""
 from .microagent import (
     BaseMicroagent,
     KnowledgeMicroagent,

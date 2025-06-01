@@ -1,13 +1,5 @@
-"""
-Controller module for OpenReplica
-"""
-from .agent import Agent
-from .agent_controller import AgentController
-from .state import State, TrafficControlState
+from app.controller.agent_controller import AgentController
 
 __all__ = [
-    "Agent",
-    "AgentController", 
-    "State",
-    "TrafficControlState"
+    'AgentController',
 ]

@@ -1,6 +1,3 @@
-"""
-State management for OpenReplica matching OpenHands exactly
-"""
 from __future__ import annotations
 
 import base64
@@ -10,8 +7,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-import app
-from app.core.logging import get_logger
+import openhands
+from app.core.logger import openreplica_logger as logger
 from app.core.schema import AgentState
 from app.events.action import (
     MessageAction,
@@ -22,8 +19,6 @@ from app.llm.metrics import Metrics
 from app.memory.view import View
 from app.storage.files import FileStore
 from app.storage.locations import get_conversation_agent_state_filename
-
-logger = get_logger(__name__)
 
 
 class TrafficControlState(str, Enum):
@@ -102,286 +97,143 @@ class State:
     # start_id and end_id track the range of events in history
     start_id: int = -1
     end_id: int = -1
-    # a delegate can be stuck while trying to complete a task
-    almost_stuck: int = 0
-    # the last error encountered, if any
-    last_error: str | None = None
-    # the total budget used for the current task
-    budget_used: float = 0.0
-    # the maximum budget allowed for the current task
-    max_budget_per_task: float | None = None
-    # saving information about the task's completed status
-    task_completed: bool = False
-    # save the summary of the current task for the case of delegate
-    summary: dict[str, Any] = field(default_factory=dict)
-    # saving information about the subtask's completed status for the case of delegate
-    subtask_completed: bool = False
-    # save the delegate summary of the current subtask for the case of delegate
-    delegate_summary: dict[str, Any] = field(default_factory=dict)
-    # extra data that can be used by different agents
+
+    delegates: dict[tuple[int, int], tuple[str, str]] = field(default_factory=dict)
+    # NOTE: This will never be used by the controller, but it can be used by different
+    # evaluation tasks to store extra data needed to track the progress/state of the task.
     extra_data: dict[str, Any] = field(default_factory=dict)
+    last_error: str = ''
 
     def save_to_session(
-        self, file_store: FileStore, session_id: str | None = None
+        self, sid: str, file_store: FileStore, user_id: str | None
     ) -> None:
-        """Save the current state to a session file.
-
-        Args:
-            file_store: The file store to save to.
-            session_id: The session ID to save to. If None, uses the current session_id.
-        """
-        if session_id is None:
-            session_id = self.session_id
-
+        pickled = pickle.dumps(self)
+        logger.debug(f'Saving state to session {sid}:{self.agent_state}')
+        encoded = base64.b64encode(pickled).decode('utf-8')
         try:
-            # Serialize the state
-            state_data = self.serialize()
-            
-            # Save to file store
-            filename = get_conversation_agent_state_filename(session_id)
-            file_store.write(filename, state_data)
-            
-            logger.info(f'Saved agent state to session {session_id}')
-            
-        except Exception as e:
-            logger.error(f'Failed to save agent state: {e}')
-            raise
+            file_store.write(
+                get_conversation_agent_state_filename(sid, user_id), encoded
+            )
 
-    @classmethod
-    def restore_from_session(
-        cls, file_store: FileStore, session_id: str
-    ) -> 'State | None':
-        """Restore state from a session file.
-
-        Args:
-            file_store: The file store to restore from.
-            session_id: The session ID to restore from.
-
-        Returns:
-            The restored state, or None if not found.
-        """
-        try:
-            filename = get_conversation_agent_state_filename(session_id)
-            
-            if not file_store.exists(filename):
-                logger.warning(f'No agent state found for session {session_id}')
-                return None
-            
-            # Load from file store
-            state_data = file_store.read(filename)
-            
-            # Deserialize the state
-            state = cls.deserialize(state_data)
-            state.session_id = session_id
-            
-            logger.info(f'Restored agent state from session {session_id}')
-            return state
-            
-        except Exception as e:
-            logger.error(f'Failed to restore agent state: {e}')
-            return None
-
-    def serialize(self) -> str:
-        """Serialize the state to a string.
-
-        Returns:
-            Base64 encoded pickle data.
-        """
-        try:
-            # Create a copy without unpickleable objects
-            state_dict = {}
-            for key, value in self.__dict__.items():
+            # see if state is in the old directory on saas/remote use cases and delete it.
+            if user_id:
+                filename = get_conversation_agent_state_filename(sid)
                 try:
-                    # Test if the value is pickleable
-                    pickle.dumps(value)
-                    state_dict[key] = value
-                except (pickle.PicklingError, TypeError):
-                    logger.warning(f'Skipping unpickleable field: {key}')
-            
-            # Serialize to bytes
-            pickled_data = pickle.dumps(state_dict)
-            
-            # Encode to base64 string
-            encoded_data = base64.b64encode(pickled_data).decode('utf-8')
-            
-            return encoded_data
-            
+                    file_store.delete(filename)
+                except Exception:
+                    pass
         except Exception as e:
-            logger.error(f'Failed to serialize state: {e}')
-            raise
+            logger.error(f'Failed to save state to session: {e}')
+            raise e
 
-    @classmethod
-    def deserialize(cls, data: str) -> 'State':
-        """Deserialize state from a string.
-
-        Args:
-            data: Base64 encoded pickle data.
-
-        Returns:
-            The deserialized state.
+    @staticmethod
+    def restore_from_session(
+        sid: str, file_store: FileStore, user_id: str | None = None
+    ) -> 'State':
         """
+        Restores the state from the previously saved session.
+        """
+
+        state: State
         try:
-            # Decode from base64
-            pickled_data = base64.b64decode(data.encode('utf-8'))
-            
-            # Deserialize from bytes
-            state_dict = pickle.loads(pickled_data)
-            
-            # Create new state instance
-            state = cls()
-            
-            # Set attributes
-            for key, value in state_dict.items():
-                setattr(state, key, value)
-            
-            return state
-            
+            encoded = file_store.read(
+                get_conversation_agent_state_filename(sid, user_id)
+            )
+            pickled = base64.b64decode(encoded)
+            state = pickle.loads(pickled)
+        except FileNotFoundError:
+            # if user_id is provided, we are in a saas/remote use case
+            # and we need to check if the state is in the old directory.
+            if user_id:
+                filename = get_conversation_agent_state_filename(sid)
+                encoded = file_store.read(filename)
+                pickled = base64.b64decode(encoded)
+                state = pickle.loads(pickled)
+            else:
+                raise FileNotFoundError(
+                    f'Could not restore state from session file for sid: {sid}'
+                )
         except Exception as e:
-            logger.error(f'Failed to deserialize state: {e}')
-            raise
+            logger.debug(f'Could not restore state from session: {e}')
+            raise e
 
-    def get_current_user_intent(self) -> str:
-        """Get the current user intent from the conversation history.
+        # update state
+        if state.agent_state in RESUMABLE_STATES:
+            state.resume_state = state.agent_state
+        else:
+            state.resume_state = None
 
-        Returns:
-            The latest user message content, or empty string if none found.
-        """
-        for event in reversed(self.history):
-            if (isinstance(event, MessageAction) and 
-                event.source == EventSource.USER and 
-                event.content):
-                return event.content
-        
-        return ""
+        # first state after restore
+        state.agent_state = AgentState.LOADING
+        return state
 
-    def get_completed_subtasks(self) -> list[str]:
-        """Get list of completed subtasks.
+    def __getstate__(self) -> dict:
+        # don't pickle history, it will be restored from the event stream
+        state = self.__dict__.copy()
+        state['history'] = []
 
-        Returns:
-            List of completed subtask descriptions.
-        """
-        completed = []
-        
-        for event in self.history:
-            if isinstance(event, AgentFinishAction):
-                if hasattr(event, 'summary') and event.summary:
-                    completed.append(event.summary)
-                elif hasattr(event, 'thought') and event.thought:
-                    completed.append(event.thought)
-        
-        return completed
+        # Remove any view caching attributes. They'll be rebuilt frmo the
+        # history after that gets reloaded.
+        state.pop('_history_checksum', None)
+        state.pop('_view', None)
 
-    def get_task_state(self) -> dict[str, Any]:
-        """Get the current task state summary.
+        return state
 
-        Returns:
-            Dictionary containing task state information.
-        """
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+
+        # make sure we always have the attribute history
+        if not hasattr(self, 'history'):
+            self.history = []
+
+    def get_current_user_intent(self) -> tuple[str | None, list[str] | None]:
+        """Returns the latest user message and image(if provided) that appears after a FinishAction, or the first (the task) if nothing was finished yet."""
+        last_user_message = None
+        last_user_message_image_urls: list[str] | None = []
+        for event in reversed(self.view):
+            if isinstance(event, MessageAction) and event.source == 'user':
+                last_user_message = event.content
+                last_user_message_image_urls = event.image_urls
+            elif isinstance(event, AgentFinishAction):
+                if last_user_message is not None:
+                    return last_user_message, None
+
+        return last_user_message, last_user_message_image_urls
+
+    def get_last_agent_message(self) -> MessageAction | None:
+        for event in reversed(self.view):
+            if isinstance(event, MessageAction) and event.source == EventSource.AGENT:
+                return event
+        return None
+
+    def get_last_user_message(self) -> MessageAction | None:
+        for event in reversed(self.view):
+            if isinstance(event, MessageAction) and event.source == EventSource.USER:
+                return event
+        return None
+
+    def to_llm_metadata(self, agent_name: str) -> dict:
         return {
             'session_id': self.session_id,
-            'iteration': self.iteration,
-            'local_iteration': self.local_iteration,
-            'max_iterations': self.max_iterations,
-            'agent_state': self.agent_state.value,
-            'traffic_control_state': self.traffic_control_state.value,
-            'confirmation_mode': self.confirmation_mode,
-            'delegate_level': self.delegate_level,
-            'budget_used': self.budget_used,
-            'max_budget_per_task': self.max_budget_per_task,
-            'task_completed': self.task_completed,
-            'subtask_completed': self.subtask_completed,
-            'almost_stuck': self.almost_stuck,
-            'last_error': self.last_error,
-            'history_length': len(self.history),
-            'start_id': self.start_id,
-            'end_id': self.end_id,
+            'trace_version': app.__version__,
+            'tags': [
+                f'agent:{agent_name}',
+                f'web_host:{os.environ.get("WEB_HOST", "unspecified")}',
+                f'openhands_version:{app.__version__}',
+            ],
         }
 
-    def is_budget_exceeded(self) -> bool:
-        """Check if the budget has been exceeded.
+    @property
+    def view(self) -> View:
+        # Compute a simple checksum from the history to see if we can re-use any
+        # cached view.
+        history_checksum = len(self.history)
+        old_history_checksum = getattr(self, '_history_checksum', -1)
 
-        Returns:
-            True if budget is exceeded, False otherwise.
-        """
-        if self.max_budget_per_task is None:
-            return False
-        
-        return self.budget_used >= self.max_budget_per_task
+        # If the history has changed, we need to re-create the view and update
+        # the caching.
+        if history_checksum != old_history_checksum:
+            self._history_checksum = history_checksum
+            self._view = View.from_events(self.history)
 
-    def is_stuck(self, threshold: int = 3) -> bool:
-        """Check if the agent is stuck.
-
-        Args:
-            threshold: Number of stuck iterations before considering stuck.
-
-        Returns:
-            True if agent is stuck, False otherwise.
-        """
-        return self.almost_stuck >= threshold
-
-    def can_continue(self) -> bool:
-        """Check if the agent can continue execution.
-
-        Returns:
-            True if agent can continue, False otherwise.
-        """
-        if self.task_completed or self.subtask_completed:
-            return False
-        
-        if self.agent_state in [AgentState.FINISHED, AgentState.ERROR, AgentState.STOPPED]:
-            return False
-        
-        if self.iteration >= self.max_iterations:
-            return False
-        
-        if self.is_budget_exceeded():
-            return False
-        
-        if self.traffic_control_state == TrafficControlState.THROTTLING:
-            return False
-        
-        return True
-
-    def reset_for_new_task(self) -> None:
-        """Reset state for a new task while preserving session info."""
-        self.iteration = 0
-        self.local_iteration = 0
-        self.history.clear()
-        self.inputs.clear()
-        self.outputs.clear()
-        self.agent_state = AgentState.LOADING
-        self.resume_state = None
-        self.traffic_control_state = TrafficControlState.NORMAL
-        self.almost_stuck = 0
-        self.last_error = None
-        self.budget_used = 0.0
-        self.task_completed = False
-        self.summary.clear()
-        self.subtask_completed = False
-        self.delegate_summary.clear()
-        self.extra_data.clear()
-        self.start_id = -1
-        self.end_id = -1
-        
-        # Reset metrics but keep references
-        self.metrics.reset()
-        self.local_metrics.reset()
-
-    def update_metrics(self, cost: float = 0.0) -> None:
-        """Update both global and local metrics.
-
-        Args:
-            cost: The cost to add to the budget.
-        """
-        self.budget_used += cost
-        
-        # Metrics are updated by the LLM classes directly
-        # This method is for any additional state-specific updates
-
-    def __repr__(self) -> str:
-        return (
-            f"State(session_id='{self.session_id}', "
-            f"iteration={self.iteration}, "
-            f"agent_state={self.agent_state.value}, "
-            f"delegate_level={self.delegate_level})"
-        )
+        return self._view

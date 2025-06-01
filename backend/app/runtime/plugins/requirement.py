@@ -1,6 +1,3 @@
-"""
-Plugin requirements for OpenReplica runtime matching OpenHands exactly
-"""
 from abc import abstractmethod
 from dataclasses import dataclass
 
@@ -32,9 +29,3 @@ class PluginRequirement:
     """Requirement for a plugin."""
 
     name: str
-    version: str = "latest"
-    config: dict = None
-    
-    def __post_init__(self):
-        if self.config is None:
-            self.config = {}

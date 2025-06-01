@@ -1,11 +1,10 @@
-"""
-Microagent types for OpenReplica matching OpenHands exactly
-"""
 from enum import Enum
 
 from pydantic import BaseModel, Field
 
-from app.core.config.mcp_config import MCPConfig
+from app.core.config.mcp_config import (
+    MCPConfig,
+)
 
 
 class MicroagentType(str, Enum):

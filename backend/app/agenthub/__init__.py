@@ -1,20 +1,24 @@
-"""
-Agent Hub for OpenReplica matching OpenHands exactly
-Contains all available agents
-"""
-from .codeact_agent import CodeActAgent
-from .dummy_agent import DummyAgent
-from .browsing_agent import BrowsingAgent
+from dotenv import load_dotenv
 
-# Register agents
-from app.controller.agent import Agent
+load_dotenv()
 
-Agent.register('CodeActAgent', CodeActAgent)
-Agent.register('DummyAgent', DummyAgent) 
-Agent.register('BrowsingAgent', BrowsingAgent)
+
+from app.agenthub import (  # noqa: E402
+    browsing_agent,
+    codeact_agent,
+    dummy_agent,
+    loc_agent,
+    readonly_agent,
+    visualbrowsing_agent,
+)
+from app.controller.agent import Agent  # noqa: E402
 
 __all__ = [
-    "CodeActAgent",
-    "DummyAgent",
-    "BrowsingAgent"
+    'Agent',
+    'codeact_agent',
+    'dummy_agent',
+    'browsing_agent',
+    'visualbrowsing_agent',
+    'readonly_agent',
+    'loc_agent',
 ]

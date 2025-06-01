@@ -8,12 +8,10 @@ from typing import Dict, Set
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, status
 from fastapi.responses import JSONResponse
 
-from app.core.logging import get_logger
+from app.core.logger import openreplica_logger as logger
 from app.events.serialization.event import event_to_dict, event_from_dict
 from app.server.shared import conversation_manager
 from app.server.user_auth import get_user_id
-
-logger = get_logger(__name__)
 
 app = APIRouter()
 

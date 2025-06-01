@@ -1,6 +1,3 @@
-"""
-LLM Configuration for OpenReplica matching OpenHands exactly with improvements
-"""
 from __future__ import annotations
 
 import os
@@ -8,9 +5,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, SecretStr, ValidationError
 
-from app.core.logging import LOG_DIR, get_logger
-
-logger = get_logger(__name__)
+from app.core.logger import LOG_DIR
+from app.core.logger import openreplica_logger as logger
 
 
 class LLMConfig(BaseModel):
@@ -49,18 +45,16 @@ class LLMConfig(BaseModel):
         native_tool_calling: Whether to use native tool calling if supported by the model. Can be True, False, or not set.
         reasoning_effort: The effort to put into reasoning. This is a string that can be one of 'low', 'medium', 'high', or 'none'. Exclusive for o1 models.
         seed: The seed to use for the LLM.
-        openrouter_site_url: Site URL for OpenRouter attribution.
-        openrouter_app_name: App name for OpenRouter attribution.
     """
 
-    model: str = Field(default='claude-3-5-sonnet-20241022')
+    model: str = Field(default='claude-sonnet-4-20250514')
     api_key: SecretStr | None = Field(default=None)
     base_url: str | None = Field(default=None)
     api_version: str | None = Field(default=None)
     aws_access_key_id: SecretStr | None = Field(default=None)
     aws_secret_access_key: SecretStr | None = Field(default=None)
     aws_region_name: str | None = Field(default=None)
-    openrouter_site_url: str = Field(default='https://github.com/ct1tz-bdgz/OpenReplica')
+    openrouter_site_url: str = Field(default='https://docs.all-hands.dev/')
     openrouter_app_name: str = Field(default='OpenReplica')
     # total wait time: 5 + 10 + 20 + 30 = 65 seconds
     num_retries: int = Field(default=4)
@@ -96,7 +90,7 @@ class LLMConfig(BaseModel):
     model_config = {'extra': 'forbid'}
 
     @classmethod
-    def from_toml_section(cls, data: dict) -> dict[str, 'LLMConfig']:
+    def from_toml_section(cls, data: dict) -> dict[str, LLMConfig]:
         """
         Create a mapping of LLMConfig instances from a toml dictionary representing the [llm] section.
 
@@ -104,305 +98,76 @@ class LLMConfig(BaseModel):
         Then, each key with a dict value (e.g. [llm.random_name]) is treated as a custom LLM configuration,
         and its values override the default configuration.
 
-        Args:
-            data: The dictionary representing the [llm] section of the toml config file.
+        Example:
+        Apply generic LLM config with custom LLM overrides, e.g.
+            [llm]
+            model=...
+            num_retries = 5
+            [llm.claude]
+            model="claude-3-5-sonnet"
+        results in num_retries APPLIED to claude-3-5-sonnet.
 
         Returns:
-            A mapping of LLMConfig instances, where the key 'default' corresponds to the default configuration.
+            dict[str, LLMConfig]: A mapping where the key "llm" corresponds to the default configuration
+            and additional keys represent custom configurations.
         """
-        llm_configs = {}
 
-        # Build the default configuration from all non-dict keys
-        default_config_data = {k: v for k, v in data.items() if not isinstance(v, dict)}
-        
+        # Initialize the result mapping
+        llm_mapping: dict[str, LLMConfig] = {}
+
+        # Extract base config data (non-dict values)
+        base_data = {}
+        custom_sections: dict[str, dict] = {}
+        for key, value in data.items():
+            if isinstance(value, dict):
+                custom_sections[key] = value
+            else:
+                base_data[key] = value
+
+        # Try to create the base config
         try:
-            default_config = cls.model_validate(default_config_data)
-            llm_configs['default'] = default_config
-        except ValidationError as e:
-            logger.error(f'Error creating default LLM config: {e}')
-            llm_configs['default'] = cls()  # Use default constructor
+            base_config = cls.model_validate(base_data)
+            llm_mapping['llm'] = base_config
+        except ValidationError:
+            logger.warning(
+                'Cannot parse [llm] config from toml. Continuing with defaults.'
+            )
+            # If base config fails, create a default one
+            base_config = cls()
+            # Still add it to the mapping
+            llm_mapping['llm'] = base_config
 
-        # Build custom configurations
-        for name, custom_data in data.items():
-            if isinstance(custom_data, dict):
-                # Merge with default configuration
-                merged_data = {**default_config_data, **custom_data}
-                try:
-                    custom_config = cls.model_validate(merged_data)
-                    llm_configs[name] = custom_config
-                except ValidationError as e:
-                    logger.error(f'Error creating custom LLM config {name}: {e}')
-                    # Fall back to default config
-                    llm_configs[name] = llm_configs['default']
+        # Process each custom section independently
+        for name, overrides in custom_sections.items():
+            try:
+                # Merge base config with overrides
+                merged = {**base_config.model_dump(), **overrides}
+                custom_config = cls.model_validate(merged)
+                llm_mapping[name] = custom_config
+            except ValidationError:
+                logger.warning(
+                    f'Cannot parse [{name}] config from toml. This section will be skipped.'
+                )
+                # Skip this custom section but continue with others
+                continue
 
-        return llm_configs
+        return llm_mapping
 
-    def get_provider_type(self) -> str:
+    def model_post_init(self, __context: Any) -> None:
+        """Post-initialization hook to assign OpenRouter-related variables to environment variables.
+
+        This ensures that these values are accessible to litellm at runtime.
         """
-        Determine the provider type based on the model name and configuration.
-        
-        Returns:
-            The provider type string (e.g., 'openai', 'anthropic', 'openrouter', etc.)
-        """
-        model_lower = self.model.lower()
-        
-        # OpenRouter detection
-        if 'openrouter' in model_lower or (self.base_url and 'openrouter.ai' in self.base_url):
-            return 'openrouter'
-        
-        # Provider detection by model prefix
-        if model_lower.startswith(('gpt-', 'o1-', 'o3-', 'davinci-', 'ada-', 'babbage-', 'curie-')):
-            return 'openai'
-        elif model_lower.startswith('claude-'):
-            return 'anthropic'
-        elif model_lower.startswith(('gemini-', 'palm-', 'bison-')):
-            return 'google'
-        elif model_lower.startswith('command-'):
-            return 'cohere'
-        elif model_lower.startswith('azure/'):
-            return 'azure'
-        elif model_lower.startswith('bedrock/'):
-            return 'bedrock'
-        elif model_lower.startswith('vertex_ai/'):
-            return 'vertex'
-        elif 'llama' in model_lower or 'mistral' in model_lower or 'codellama' in model_lower:
-            if self.ollama_base_url or (self.base_url and 'ollama' in self.base_url):
-                return 'ollama'
-            else:
-                return 'huggingface'
-        
-        # Base URL detection
-        if self.base_url:
-            base_url_lower = self.base_url.lower()
-            if 'openai' in base_url_lower:
-                return 'openai'
-            elif 'anthropic' in base_url_lower:
-                return 'anthropic'
-            elif 'openrouter.ai' in base_url_lower:
-                return 'openrouter'
-            elif 'ollama' in base_url_lower:
-                return 'ollama'
-            elif 'cohere' in base_url_lower:
-                return 'cohere'
-            elif 'together' in base_url_lower:
-                return 'together'
-            elif 'replicate' in base_url_lower:
-                return 'replicate'
-            else:
-                return 'custom'
-        
-        # Default to custom if we can't determine
-        return 'custom'
+        super().model_post_init(__context)
 
-    def get_available_models(self) -> list[str]:
-        """
-        Get available models for the provider type.
-        
-        Returns:
-            List of available model names for this provider.
-        """
-        provider = self.get_provider_type()
-        
-        # This would be populated from actual provider APIs in a real implementation
-        provider_models = {
-            'openai': [
-                'gpt-4o',
-                'gpt-4o-mini', 
-                'gpt-4-turbo',
-                'gpt-4',
-                'gpt-3.5-turbo',
-                'o1-preview',
-                'o1-mini',
-                'o1-2024-12-17',
-                'o3-mini-2025-01-31',
-                'o3-mini',
-                'o3-2025-04-16',
-                'o4-mini-2025-04-16'
-            ],
-            'anthropic': [
-                'claude-3-5-sonnet-20241022',
-                'claude-3-5-sonnet-20240620', 
-                'claude-3-5-haiku-20241022',
-                'claude-3-opus-20240229',
-                'claude-3-sonnet-20240229',
-                'claude-3-haiku-20240307',
-                'claude-2.1',
-                'claude-2.0',
-                'claude-instant-1.2'
-            ],
-            'google': [
-                'gemini-pro',
-                'gemini-pro-vision',
-                'gemini-1.5-pro',
-                'gemini-1.5-flash',
-                'palm-2-chat-bison',
-                'palm-2-codechat-bison'
-            ],
-            'cohere': [
-                'command-r-plus',
-                'command-r',
-                'command-nightly',
-                'command-light-nightly'
-            ],
-            'openrouter': [
-                # OpenRouter has hundreds of models, this is a subset
-                'openai/gpt-4o',
-                'openai/gpt-4o-mini',
-                'anthropic/claude-3-5-sonnet',
-                'anthropic/claude-3-haiku',
-                'google/gemini-pro',
-                'meta-llama/llama-3.1-405b-instruct',
-                'meta-llama/llama-3.1-70b-instruct',
-                'mistralai/mistral-large',
-                'qwen/qwen-2.5-72b-instruct',
-                'deepseek/deepseek-chat'
-            ],
-            'ollama': [
-                'llama3.2',
-                'llama3.1',
-                'codellama',
-                'mistral',
-                'mixtral',
-                'qwen2.5',
-                'deepseek-coder',
-                'phi3'
-            ]
-        }
-        
-        return provider_models.get(provider, [self.model])
+        # Assign OpenRouter-specific variables to environment variables
+        if self.openrouter_site_url:
+            os.environ['OR_SITE_URL'] = self.openrouter_site_url
+        if self.openrouter_app_name:
+            os.environ['OR_APP_NAME'] = self.openrouter_app_name
 
-    def supports_function_calling(self) -> bool:
-        """Check if the model supports function calling."""
-        provider = self.get_provider_type()
-        model_lower = self.model.lower()
-        
-        # Known function calling models
-        function_calling_models = [
-            'gpt-4', 'gpt-3.5-turbo', 'claude-3', 'gemini-pro', 'command-r'
-        ]
-        
-        return any(model in model_lower for model in function_calling_models)
-
-    def supports_vision(self) -> bool:
-        """Check if the model supports vision capabilities."""
-        model_lower = self.model.lower()
-        
-        vision_keywords = [
-            'vision', 'gpt-4o', 'claude-3', 'gemini-pro-vision', 'gemini-1.5'
-        ]
-        
-        return any(keyword in model_lower for keyword in vision_keywords)
-
-    def get_cost_info(self) -> dict[str, float]:
-        """Get cost information for the model."""
-        return {
-            'input_cost_per_token': self.input_cost_per_token or 0.0,
-            'output_cost_per_token': self.output_cost_per_token or 0.0
-        }
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary, handling SecretStr fields."""
-        data = self.model_dump()
-        
-        # Convert SecretStr to string for serialization
-        if self.api_key:
-            data['api_key'] = self.api_key.get_secret_value()
-        if self.aws_access_key_id:
-            data['aws_access_key_id'] = self.aws_access_key_id.get_secret_value()
-        if self.aws_secret_access_key:
-            data['aws_secret_access_key'] = self.aws_secret_access_key.get_secret_value()
-            
-        return data
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> 'LLMConfig':
-        """Create from dictionary, handling SecretStr fields."""
-        # Convert string secrets to SecretStr
-        if 'api_key' in data and data['api_key']:
-            data['api_key'] = SecretStr(data['api_key'])
-        if 'aws_access_key_id' in data and data['aws_access_key_id']:
-            data['aws_access_key_id'] = SecretStr(data['aws_access_key_id'])
-        if 'aws_secret_access_key' in data and data['aws_secret_access_key']:
-            data['aws_secret_access_key'] = SecretStr(data['aws_secret_access_key'])
-            
-        return cls.model_validate(data)
-
-    def __str__(self) -> str:
-        """String representation without exposing secrets."""
-        return f"LLMConfig(model={self.model}, provider={self.get_provider_type()})"
-
-    def __repr__(self) -> str:
-        """Detailed representation without exposing secrets."""
-        return (
-            f"LLMConfig(model={self.model}, provider={self.get_provider_type()}, "
-            f"temperature={self.temperature}, max_output_tokens={self.max_output_tokens})"
-        )
-
-
-# Predefined configurations for popular models
-POPULAR_MODELS = {
-    'gpt-4o': LLMConfig(
-        model='gpt-4o',
-        temperature=0.1,
-        max_output_tokens=4096
-    ),
-    'claude-3-5-sonnet': LLMConfig(
-        model='claude-3-5-sonnet-20241022',
-        temperature=0.1,
-        max_output_tokens=4096
-    ),
-    'gemini-pro': LLMConfig(
-        model='gemini-pro',
-        temperature=0.1,
-        max_output_tokens=4096
-    ),
-    'o1-preview': LLMConfig(
-        model='o1-preview',
-        temperature=1.0,  # o1 models don't support temperature control
-        reasoning_effort='high',
-        max_output_tokens=32768
-    )
-}
-
-
-def get_default_llm_config() -> LLMConfig:
-    """Get the default LLM configuration."""
-    return LLMConfig()
-
-
-def create_llm_config_from_env() -> LLMConfig:
-    """Create LLM config from environment variables."""
-    config_data = {}
-    
-    # Map environment variables to config fields
-    env_mappings = {
-        'OPENAI_API_KEY': 'api_key',
-        'ANTHROPIC_API_KEY': 'api_key',
-        'GOOGLE_API_KEY': 'api_key',
-        'COHERE_API_KEY': 'api_key',
-        'OPENROUTER_API_KEY': 'api_key',
-        'LLM_MODEL': 'model',
-        'LLM_BASE_URL': 'base_url',
-        'LLM_API_VERSION': 'api_version',
-        'LLM_TEMPERATURE': 'temperature',
-        'LLM_MAX_TOKENS': 'max_output_tokens',
-        'AWS_ACCESS_KEY_ID': 'aws_access_key_id',
-        'AWS_SECRET_ACCESS_KEY': 'aws_secret_access_key',
-        'AWS_REGION': 'aws_region_name',
-        'OLLAMA_BASE_URL': 'ollama_base_url'
-    }
-    
-    for env_var, config_field in env_mappings.items():
-        value = os.getenv(env_var)
-        if value:
-            # Convert types as needed
-            if config_field in ['temperature']:
-                config_data[config_field] = float(value)
-            elif config_field in ['max_output_tokens']:
-                config_data[config_field] = int(value)
-            elif config_field in ['api_key', 'aws_access_key_id', 'aws_secret_access_key']:
-                config_data[config_field] = SecretStr(value)
-            else:
-                config_data[config_field] = value
-    
-    return LLMConfig.model_validate(config_data) if config_data else LLMConfig()
+        # Set an API version by default for Azure models
+        # Required for newer models.
+        # Azure issue: https://github.com/All-Hands-AI/OpenReplica/issues/7755
+        if self.model.startswith('azure') and self.api_version is None:
+            self.api_version = '2024-12-01-preview'

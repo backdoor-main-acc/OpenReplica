@@ -1,154 +1,253 @@
+"""This file contains the function calling implementation for different actions.
+
+This is similar to the functionality of `CodeActResponseParser`.
 """
-Function calling utilities for CodeAct agent matching OpenHands
-"""
-from typing import TYPE_CHECKING, List
+
 import json
 
-if TYPE_CHECKING:
-    from app.llm.llm import ModelResponse
-    from app.controller.agent import Agent
-    from app.controller.state.state import State
-    from app.events.action import Action
-
-from app.core.logging import get_logger
-from app.events.action import (
-    CmdRunAction,
-    IPythonRunCellAction,
-    FileEditAction,
-    FileReadAction,
-    FileWriteAction,
-    BrowseURLAction,
-    BrowseInteractiveAction,
-    MessageAction,
-    AgentFinishAction,
-    AgentThinkAction
+from litellm import (
+    ModelResponse,
 )
 
-logger = get_logger(__name__)
+from app.agenthub.codeact_agent.tools import (
+    BrowserTool,
+    FinishTool,
+    IPythonTool,
+    LLMBasedFileEditTool,
+    ThinkTool,
+    create_cmd_run_tool,
+    create_str_replace_editor_tool,
+)
+from app.core.exceptions import (
+    FunctionCallNotExistsError,
+    FunctionCallValidationError,
+)
+from app.core.logger import openreplica_logger as logger
+from app.events.action import (
+    Action,
+    AgentDelegateAction,
+    AgentFinishAction,
+    AgentThinkAction,
+    BrowseInteractiveAction,
+    CmdRunAction,
+    FileEditAction,
+    FileReadAction,
+    IPythonRunCellAction,
+    MessageAction,
+)
+from app.events.action.mcp import MCPAction
+from app.events.event import FileEditSource, FileReadSource
+from app.events.tool import ToolCallMetadata
+
+
+def combine_thought(action: Action, thought: str) -> Action:
+    if not hasattr(action, 'thought'):
+        return action
+    if thought and action.thought:
+        action.thought = f'{thought}\n{action.thought}'
+    elif thought:
+        action.thought = thought
+    return action
 
 
 def response_to_actions(
-    response: 'ModelResponse',
-    agent: 'Agent',
-    state: 'State'
-) -> List['Action']:
-    """Convert LLM response to a list of actions"""
-    actions = []
-    
-    try:
-        choice = response.choices[0] if response.choices else None
-        if not choice:
-            return [MessageAction("No response from LLM")]
-        
-        message = choice.message
-        
-        # Handle function/tool calls
-        if hasattr(message, 'tool_calls') and message.tool_calls:
-            for tool_call in message.tool_calls:
-                action = _tool_call_to_action(tool_call)
-                if action:
-                    actions.append(action)
-        
-        # Handle regular message content
-        if message.content and message.content.strip():
-            actions.append(MessageAction(message.content.strip()))
-        
-        # If no actions were created, create a default message action
-        if not actions:
-            actions.append(MessageAction("I need to think about this..."))
-            
-    except Exception as e:
-        logger.error(f"Error converting response to actions: {e}")
-        actions.append(MessageAction(f"Error processing response: {str(e)}"))
-    
+    response: ModelResponse, mcp_tool_names: list[str] | None = None
+) -> list[Action]:
+    actions: list[Action] = []
+    assert len(response.choices) == 1, 'Only one choice is supported for now'
+    choice = response.choices[0]
+    assistant_msg = choice.message
+    if hasattr(assistant_msg, 'tool_calls') and assistant_msg.tool_calls:
+        # Check if there's assistant_msg.content. If so, add it to the thought
+        thought = ''
+        if isinstance(assistant_msg.content, str):
+            thought = assistant_msg.content
+        elif isinstance(assistant_msg.content, list):
+            for msg in assistant_msg.content:
+                if msg['type'] == 'text':
+                    thought += msg['text']
+
+        # Process each tool call to OpenReplica action
+        for i, tool_call in enumerate(assistant_msg.tool_calls):
+            action: Action
+            logger.debug(f'Tool call in function_calling.py: {tool_call}')
+            try:
+                arguments = json.loads(tool_call.function.arguments)
+            except json.decoder.JSONDecodeError as e:
+                raise FunctionCallValidationError(
+                    f'Failed to parse tool call arguments: {tool_call.function.arguments}'
+                ) from e
+
+            # ================================================
+            # CmdRunTool (Bash)
+            # ================================================
+
+            if tool_call.function.name == create_cmd_run_tool()['function']['name']:
+                if 'command' not in arguments:
+                    raise FunctionCallValidationError(
+                        f'Missing required argument "command" in tool call {tool_call.function.name}'
+                    )
+                # convert is_input to boolean
+                is_input = arguments.get('is_input', 'false') == 'true'
+                action = CmdRunAction(command=arguments['command'], is_input=is_input)
+
+                # Set hard timeout if provided
+                if 'timeout' in arguments:
+                    try:
+                        action.set_hard_timeout(float(arguments['timeout']))
+                    except ValueError as e:
+                        raise FunctionCallValidationError(
+                            f"Invalid float passed to 'timeout' argument: {arguments['timeout']}"
+                        ) from e
+
+            # ================================================
+            # IPythonTool (Jupyter)
+            # ================================================
+            elif tool_call.function.name == IPythonTool['function']['name']:
+                if 'code' not in arguments:
+                    raise FunctionCallValidationError(
+                        f'Missing required argument "code" in tool call {tool_call.function.name}'
+                    )
+                action = IPythonRunCellAction(code=arguments['code'])
+            elif tool_call.function.name == 'delegate_to_browsing_agent':
+                action = AgentDelegateAction(
+                    agent='BrowsingAgent',
+                    inputs=arguments,
+                )
+
+            # ================================================
+            # AgentFinishAction
+            # ================================================
+            elif tool_call.function.name == FinishTool['function']['name']:
+                action = AgentFinishAction(
+                    final_thought=arguments.get('message', ''),
+                    task_completed=arguments.get('task_completed', None),
+                )
+
+            # ================================================
+            # LLMBasedFileEditTool (LLM-based file editor, deprecated)
+            # ================================================
+            elif tool_call.function.name == LLMBasedFileEditTool['function']['name']:
+                if 'path' not in arguments:
+                    raise FunctionCallValidationError(
+                        f'Missing required argument "path" in tool call {tool_call.function.name}'
+                    )
+                if 'content' not in arguments:
+                    raise FunctionCallValidationError(
+                        f'Missing required argument "content" in tool call {tool_call.function.name}'
+                    )
+                action = FileEditAction(
+                    path=arguments['path'],
+                    content=arguments['content'],
+                    start=arguments.get('start', 1),
+                    end=arguments.get('end', -1),
+                )
+            elif (
+                tool_call.function.name
+                == create_str_replace_editor_tool()['function']['name']
+            ):
+                if 'command' not in arguments:
+                    raise FunctionCallValidationError(
+                        f'Missing required argument "command" in tool call {tool_call.function.name}'
+                    )
+                if 'path' not in arguments:
+                    raise FunctionCallValidationError(
+                        f'Missing required argument "path" in tool call {tool_call.function.name}'
+                    )
+                path = arguments['path']
+                command = arguments['command']
+                other_kwargs = {
+                    k: v for k, v in arguments.items() if k not in ['command', 'path']
+                }
+
+                if command == 'view':
+                    action = FileReadAction(
+                        path=path,
+                        impl_source=FileReadSource.OH_ACI,
+                        view_range=other_kwargs.get('view_range', None),
+                    )
+                else:
+                    if 'view_range' in other_kwargs:
+                        # Remove view_range from other_kwargs since it is not needed for FileEditAction
+                        other_kwargs.pop('view_range')
+
+                    # Filter out unexpected arguments
+                    valid_kwargs = {}
+                    # Get valid parameters from the str_replace_editor tool definition
+                    str_replace_editor_tool = create_str_replace_editor_tool()
+                    valid_params = set(
+                        str_replace_editor_tool['function']['parameters'][
+                            'properties'
+                        ].keys()
+                    )
+                    for key, value in other_kwargs.items():
+                        if key in valid_params:
+                            valid_kwargs[key] = value
+                        else:
+                            raise FunctionCallValidationError(
+                                f'Unexpected argument {key} in tool call {tool_call.function.name}. Allowed arguments are: {valid_params}'
+                            )
+
+                    action = FileEditAction(
+                        path=path,
+                        command=command,
+                        impl_source=FileEditSource.OH_ACI,
+                        **valid_kwargs,
+                    )
+            # ================================================
+            # AgentThinkAction
+            # ================================================
+            elif tool_call.function.name == ThinkTool['function']['name']:
+                action = AgentThinkAction(thought=arguments.get('thought', ''))
+
+            # ================================================
+            # BrowserTool
+            # ================================================
+            elif tool_call.function.name == BrowserTool['function']['name']:
+                if 'code' not in arguments:
+                    raise FunctionCallValidationError(
+                        f'Missing required argument "code" in tool call {tool_call.function.name}'
+                    )
+                action = BrowseInteractiveAction(browser_actions=arguments['code'])
+
+            # ================================================
+            # MCPAction (MCP)
+            # ================================================
+            elif mcp_tool_names and tool_call.function.name in mcp_tool_names:
+                action = MCPAction(
+                    name=tool_call.function.name,
+                    arguments=arguments,
+                )
+            else:
+                raise FunctionCallNotExistsError(
+                    f'Tool {tool_call.function.name} is not registered. (arguments: {arguments}). Please check the tool name and retry with an existing tool.'
+                )
+
+            # We only add thought to the first action
+            if i == 0:
+                action = combine_thought(action, thought)
+            # Add metadata for tool calling
+            action.tool_call_metadata = ToolCallMetadata(
+                tool_call_id=tool_call.id,
+                function_name=tool_call.function.name,
+                model_response=response,
+                total_calls_in_response=len(assistant_msg.tool_calls),
+            )
+            actions.append(action)
+    else:
+        actions.append(
+            MessageAction(
+                content=str(assistant_msg.content) if assistant_msg.content else '',
+                wait_for_response=True,
+            )
+        )
+
+    # Add response id to actions
+    # This will ensure we can match both actions without tool calls (e.g. MessageAction)
+    # and actions with tool calls (e.g. CmdRunAction, IPythonRunCellAction, etc.)
+    # with the token usage data
+    for action in actions:
+        action.response_id = response.id
+
+    assert len(actions) >= 1
     return actions
-
-
-def _tool_call_to_action(tool_call) -> 'Action':
-    """Convert a tool call to an action"""
-    try:
-        function_name = tool_call.function.name
-        arguments_str = tool_call.function.arguments
-        
-        # Parse arguments
-        try:
-            arguments = json.loads(arguments_str) if isinstance(arguments_str, str) else arguments_str
-        except json.JSONDecodeError:
-            return MessageAction(f"Invalid arguments for {function_name}: {arguments_str}")
-        
-        # Map function names to actions
-        if function_name == "str_replace_editor":
-            return _handle_str_replace_editor(arguments)
-        elif function_name == "bash":
-            return _handle_bash(arguments)
-        elif function_name == "ipython":
-            return _handle_ipython(arguments)
-        elif function_name == "browser":
-            return _handle_browser(arguments)
-        elif function_name == "think":
-            return _handle_think(arguments)
-        elif function_name == "finish":
-            return _handle_finish(arguments)
-        else:
-            return MessageAction(f"Unknown function: {function_name}")
-            
-    except Exception as e:
-        logger.error(f"Error converting tool call to action: {e}")
-        return MessageAction(f"Error processing tool call: {str(e)}")
-
-
-def _handle_str_replace_editor(arguments: dict) -> 'Action':
-    """Handle str_replace_editor tool calls"""
-    command = arguments.get("command")
-    path = arguments.get("path", "")
-    
-    if command == "view":
-        return FileReadAction(path=path)
-    elif command == "create":
-        content = arguments.get("file_text", "")
-        return FileWriteAction(path=path, content=content)
-    elif command == "str_replace":
-        old_str = arguments.get("old_str", "")
-        new_str = arguments.get("new_str", "")
-        return FileEditAction(path=path, old_str=old_str, new_str=new_str)
-    else:
-        return MessageAction(f"Unknown str_replace_editor command: {command}")
-
-
-def _handle_bash(arguments: dict) -> 'Action':
-    """Handle bash tool calls"""
-    command = arguments.get("command", "")
-    return CmdRunAction(command=command)
-
-
-def _handle_ipython(arguments: dict) -> 'Action':
-    """Handle ipython tool calls"""
-    code = arguments.get("code", "")
-    return IPythonRunCellAction(code=code)
-
-
-def _handle_browser(arguments: dict) -> 'Action':
-    """Handle browser tool calls"""
-    action = arguments.get("action")
-    
-    if action == "navigate":
-        url = arguments.get("url", "")
-        return BrowseURLAction(url=url)
-    elif action == "interact":
-        coordinate = arguments.get("coordinate", [0, 0])
-        return BrowseInteractiveAction(coordinate=coordinate)
-    else:
-        return MessageAction(f"Unknown browser action: {action}")
-
-
-def _handle_think(arguments: dict) -> 'Action':
-    """Handle think tool calls"""
-    thought = arguments.get("thought", "")
-    return AgentThinkAction(thought=thought)
-
-
-def _handle_finish(arguments: dict) -> 'Action':
-    """Handle finish tool calls"""
-    outputs = arguments.get("outputs", {})
-    summary = arguments.get("summary", "Task completed")
-    return AgentFinishAction(outputs=outputs, summary=summary)

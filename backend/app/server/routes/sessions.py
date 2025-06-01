@@ -7,10 +7,9 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 import uuid
 
-from app.core.logging import get_logger
+from app.core.logger import openreplica_logger as logger
 
 router = APIRouter()
-logger = get_logger(__name__)
 
 # In-memory store for demo (use database in production)
 active_sessions: Dict[str, Dict[str, Any]] = {}

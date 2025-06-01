@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from app.core.logging import get_logger
+from app.core.logger import openreplica_logger as logger
 from app.microagent import (
     BaseMicroagent,
     KnowledgeMicroagent,
@@ -19,9 +19,8 @@ from app.microagent import (
 )
 from app.server.dependencies import get_dependencies
 from app.server.user_auth import get_user_id
-from app.storage.microagents.microagent_store import get_microagent_store
+from app.storage.custom_storage.microagents.microagent_store import get_microagent_store
 
-logger = get_logger(__name__)
 
 app = APIRouter(prefix='/api/microagents', dependencies=get_dependencies())
 

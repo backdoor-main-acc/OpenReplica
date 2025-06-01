@@ -1,33 +1,41 @@
-"""
-Finish tool for CodeAct agent matching OpenHands exactly
-"""
-from litellm import ChatCompletionToolParam
+from litellm import ChatCompletionToolParam, ChatCompletionToolParamFunctionChunk
 
+from app.llm.tool_names import FINISH_TOOL_NAME
 
-class FinishTool:
-    """Tool for agent to finish a task"""
-    
-    def to_tool_param(self) -> ChatCompletionToolParam:
-        """Convert to tool parameter format"""
-        return {
-            "type": "function",
-            "function": {
-                "name": "finish",
-                "description": "Use this tool when you have completed the task. Provide a summary of what was accomplished and any relevant outputs.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "summary": {
-                            "type": "string",
-                            "description": "A summary of what was accomplished"
-                        },
-                        "outputs": {
-                            "type": "object",
-                            "description": "Any relevant outputs or results from the task",
-                            "additionalProperties": True
-                        }
-                    },
-                    "required": ["summary"]
-                }
-            }
-        }
+_FINISH_DESCRIPTION = """Signals the completion of the current task or conversation.
+
+Use this tool when:
+- You have successfully completed the user's requested task
+- You cannot proceed further due to technical limitations or missing information
+
+The message should include:
+- A clear summary of actions taken and their results
+- Any next steps for the user
+- Explanation if you're unable to complete the task
+- Any follow-up questions if more information is needed
+
+The task_completed field should be set to True if you believed you have completed the task, and False otherwise.
+"""
+
+FinishTool = ChatCompletionToolParam(
+    type='function',
+    function=ChatCompletionToolParamFunctionChunk(
+        name=FINISH_TOOL_NAME,
+        description=_FINISH_DESCRIPTION,
+        parameters={
+            'type': 'object',
+            'required': ['message', 'task_completed'],
+            'properties': {
+                'message': {
+                    'type': 'string',
+                    'description': 'Final message to send to the user',
+                },
+                'task_completed': {
+                    'type': 'string',
+                    'enum': ['true', 'false', 'partial'],
+                    'description': 'Whether you have completed the task.',
+                },
+            },
+        },
+    ),
+)

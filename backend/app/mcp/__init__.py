@@ -1,18 +1,19 @@
-"""
-Model Context Protocol (MCP) integration for OpenReplica
-Enables LLMs to use tools and connect to external services
-"""
-from .base import MCPClient, MCPServer, MCPTool
-from .client import MCPClientManager
-from .tools import ToolRegistry, register_tool
-from .integrations import get_mcp_integrations
+from app.mcp.client import MCPClient
+from app.mcp.tool import MCPClientTool
+from app.mcp.utils import (
+    add_mcp_tools_to_agent,
+    call_tool_mcp,
+    convert_mcp_clients_to_tools,
+    create_mcp_clients,
+    fetch_mcp_tools_from_config,
+)
 
 __all__ = [
-    "MCPClient",
-    "MCPServer", 
-    "MCPTool",
-    "MCPClientManager",
-    "ToolRegistry",
-    "register_tool",
-    "get_mcp_integrations"
+    'MCPClient',
+    'convert_mcp_clients_to_tools',
+    'create_mcp_clients',
+    'MCPClientTool',
+    'fetch_mcp_tools_from_config',
+    'call_tool_mcp',
+    'add_mcp_tools_to_agent',
 ]

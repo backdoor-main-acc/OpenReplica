@@ -1,216 +1,225 @@
-"""
-LLM metrics tracking for OpenReplica matching OpenHands
-"""
+import copy
 import time
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
 
-from app.core.logging import get_logger
-
-logger = get_logger(__name__)
+from pydantic import BaseModel, Field
 
 
-@dataclass
-class TokenUsage:
-    """Token usage information"""
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    total_tokens: int = 0
-    cost: float = 0.0
-
-
-@dataclass
-class CompletionMetrics:
-    """Metrics for a single completion"""
+class Cost(BaseModel):
     model: str
-    timestamp: float
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
     cost: float
-    duration: float = 0.0
-    success: bool = True
-    error: Optional[str] = None
+    timestamp: float = Field(default_factory=time.time)
+
+
+class ResponseLatency(BaseModel):
+    """Metric tracking the round-trip time per completion call."""
+
+    model: str
+    latency: float
+    response_id: str
+
+
+class TokenUsage(BaseModel):
+    """Metric tracking detailed token usage per completion call."""
+
+    model: str = Field(default='')
+    prompt_tokens: int = Field(default=0)
+    completion_tokens: int = Field(default=0)
+    cache_read_tokens: int = Field(default=0)
+    cache_write_tokens: int = Field(default=0)
+    context_window: int = Field(default=0)
+    per_turn_token: int = Field(default=0)
+    response_id: str = Field(default='')
+
+    def __add__(self, other: 'TokenUsage') -> 'TokenUsage':
+        """Add two TokenUsage instances together."""
+        return TokenUsage(
+            model=self.model,
+            prompt_tokens=self.prompt_tokens + other.prompt_tokens,
+            completion_tokens=self.completion_tokens + other.completion_tokens,
+            cache_read_tokens=self.cache_read_tokens + other.cache_read_tokens,
+            cache_write_tokens=self.cache_write_tokens + other.cache_write_tokens,
+            context_window=max(self.context_window, other.context_window),
+            per_turn_token=other.per_turn_token,
+            response_id=self.response_id,
+        )
 
 
 class Metrics:
-    """LLM metrics collector and tracker"""
-    
-    def __init__(self):
-        self.completions: List[CompletionMetrics] = []
-        self.total_cost = 0.0
-        self.total_tokens = 0
-        self.total_prompt_tokens = 0
-        self.total_completion_tokens = 0
-        self.model_usage: Dict[str, TokenUsage] = {}
-        self.start_time = time.time()
-    
-    def add_completion(
+    """Metrics class can record various metrics during running and evaluation.
+    We track:
+      - accumulated_cost and costs
+      - A list of ResponseLatency
+      - A list of TokenUsage (one per call).
+    """
+
+    def __init__(self, model_name: str = 'default') -> None:
+        self._accumulated_cost: float = 0.0
+        self._costs: list[Cost] = []
+        self._response_latencies: list[ResponseLatency] = []
+        self.model_name = model_name
+        self._token_usages: list[TokenUsage] = []
+        self._accumulated_token_usage: TokenUsage = TokenUsage(
+            model=model_name,
+            prompt_tokens=0,
+            completion_tokens=0,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+            context_window=0,
+            response_id='',
+        )
+
+    @property
+    def accumulated_cost(self) -> float:
+        return self._accumulated_cost
+
+    @accumulated_cost.setter
+    def accumulated_cost(self, value: float) -> None:
+        if value < 0:
+            raise ValueError('Total cost cannot be negative.')
+        self._accumulated_cost = value
+
+    @property
+    def costs(self) -> list[Cost]:
+        return self._costs
+
+    @property
+    def response_latencies(self) -> list[ResponseLatency]:
+        if not hasattr(self, '_response_latencies'):
+            self._response_latencies = []
+        return self._response_latencies
+
+    @response_latencies.setter
+    def response_latencies(self, value: list[ResponseLatency]) -> None:
+        self._response_latencies = value
+
+    @property
+    def token_usages(self) -> list[TokenUsage]:
+        if not hasattr(self, '_token_usages'):
+            self._token_usages = []
+        return self._token_usages
+
+    @token_usages.setter
+    def token_usages(self, value: list[TokenUsage]) -> None:
+        self._token_usages = value
+
+    @property
+    def accumulated_token_usage(self) -> TokenUsage:
+        """Get the accumulated token usage, initializing it if it doesn't exist."""
+        if not hasattr(self, '_accumulated_token_usage'):
+            self._accumulated_token_usage = TokenUsage(
+                model=self.model_name,
+                prompt_tokens=0,
+                completion_tokens=0,
+                cache_read_tokens=0,
+                cache_write_tokens=0,
+                context_window=0,
+                response_id='',
+            )
+        return self._accumulated_token_usage
+
+    def add_cost(self, value: float) -> None:
+        if value < 0:
+            raise ValueError('Added cost cannot be negative.')
+        self._accumulated_cost += value
+        self._costs.append(Cost(cost=value, model=self.model_name))
+
+    def add_response_latency(self, value: float, response_id: str) -> None:
+        self._response_latencies.append(
+            ResponseLatency(
+                latency=max(0.0, value), model=self.model_name, response_id=response_id
+            )
+        )
+
+    def add_token_usage(
         self,
-        model: str,
         prompt_tokens: int,
         completion_tokens: int,
-        cost: float,
-        duration: float = 0.0,
-        success: bool = True,
-        error: Optional[str] = None
-    ):
-        """Add a completion to metrics"""
-        total_tokens = prompt_tokens + completion_tokens
-        
-        completion = CompletionMetrics(
-            model=model,
-            timestamp=time.time(),
+        cache_read_tokens: int,
+        cache_write_tokens: int,
+        context_window: int,
+        response_id: str,
+    ) -> None:
+        """Add a single usage record."""
+
+        # Token each turn for calculating context usage.
+        per_turn_token = prompt_tokens + completion_tokens
+
+        usage = TokenUsage(
+            model=self.model_name,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            total_tokens=total_tokens,
-            cost=cost,
-            duration=duration,
-            success=success,
-            error=error
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            context_window=context_window,
+            per_turn_token=per_turn_token,
+            response_id=response_id,
         )
-        
-        self.completions.append(completion)
-        
-        # Update totals
-        self.total_cost += cost
-        self.total_tokens += total_tokens
-        self.total_prompt_tokens += prompt_tokens
-        self.total_completion_tokens += completion_tokens
-        
-        # Update model-specific usage
-        if model not in self.model_usage:
-            self.model_usage[model] = TokenUsage()
-        
-        model_usage = self.model_usage[model]
-        model_usage.prompt_tokens += prompt_tokens
-        model_usage.completion_tokens += completion_tokens
-        model_usage.total_tokens += total_tokens
-        model_usage.cost += cost
-        
-        logger.debug(f"LLM Metrics - Model: {model}, Tokens: {total_tokens}, Cost: ${cost:.4f}")
-    
-    def get_total_cost(self) -> float:
-        """Get total cost across all completions"""
-        return self.total_cost
-    
-    def get_total_tokens(self) -> int:
-        """Get total tokens across all completions"""
-        return self.total_tokens
-    
-    def get_model_usage(self, model: str) -> TokenUsage:
-        """Get usage for a specific model"""
-        return self.model_usage.get(model, TokenUsage())
-    
-    def get_completion_count(self) -> int:
-        """Get total number of completions"""
-        return len(self.completions)
-    
-    def get_success_rate(self) -> float:
-        """Get success rate of completions"""
-        if not self.completions:
-            return 0.0
-        
-        successful = sum(1 for c in self.completions if c.success)
-        return successful / len(self.completions)
-    
-    def get_average_tokens_per_completion(self) -> float:
-        """Get average tokens per completion"""
-        if not self.completions:
-            return 0.0
-        
-        return self.total_tokens / len(self.completions)
-    
-    def get_average_cost_per_completion(self) -> float:
-        """Get average cost per completion"""
-        if not self.completions:
-            return 0.0
-        
-        return self.total_cost / len(self.completions)
-    
-    def get_average_duration(self) -> float:
-        """Get average completion duration"""
-        if not self.completions:
-            return 0.0
-        
-        total_duration = sum(c.duration for c in self.completions if c.duration > 0)
-        count_with_duration = sum(1 for c in self.completions if c.duration > 0)
-        
-        if count_with_duration == 0:
-            return 0.0
-        
-        return total_duration / count_with_duration
-    
-    def get_summary(self) -> Dict[str, any]:
-        """Get comprehensive metrics summary"""
+        self._token_usages.append(usage)
+
+        # Update accumulated token usage using the __add__ operator
+        self._accumulated_token_usage = self.accumulated_token_usage + TokenUsage(
+            model=self.model_name,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            context_window=context_window,
+            per_turn_token=per_turn_token,
+            response_id='',
+        )
+
+    def merge(self, other: 'Metrics') -> None:
+        """Merge 'other' metrics into this one."""
+        self._accumulated_cost += other.accumulated_cost
+        self._costs += other._costs
+        # use the property so older picked objects that lack the field won't crash
+        self.token_usages += other.token_usages
+        self.response_latencies += other.response_latencies
+
+        # Merge accumulated token usage using the __add__ operator
+        self._accumulated_token_usage = (
+            self.accumulated_token_usage + other.accumulated_token_usage
+        )
+
+    def get(self) -> dict:
+        """Return the metrics in a dictionary."""
         return {
-            'total_completions': self.get_completion_count(),
-            'total_cost': self.total_cost,
-            'total_tokens': self.total_tokens,
-            'total_prompt_tokens': self.total_prompt_tokens,
-            'total_completion_tokens': self.total_completion_tokens,
-            'success_rate': self.get_success_rate(),
-            'average_tokens_per_completion': self.get_average_tokens_per_completion(),
-            'average_cost_per_completion': self.get_average_cost_per_completion(),
-            'average_duration': self.get_average_duration(),
-            'session_duration': time.time() - self.start_time,
-            'models_used': list(self.model_usage.keys()),
-            'model_usage': {
-                model: {
-                    'prompt_tokens': usage.prompt_tokens,
-                    'completion_tokens': usage.completion_tokens,
-                    'total_tokens': usage.total_tokens,
-                    'cost': usage.cost
-                }
-                for model, usage in self.model_usage.items()
-            }
-        }
-    
-    def get_recent_completions(self, limit: int = 10) -> List[CompletionMetrics]:
-        """Get recent completions"""
-        return self.completions[-limit:] if self.completions else []
-    
-    def get_completions_by_model(self, model: str) -> List[CompletionMetrics]:
-        """Get completions for a specific model"""
-        return [c for c in self.completions if c.model == model]
-    
-    def get_failed_completions(self) -> List[CompletionMetrics]:
-        """Get failed completions"""
-        return [c for c in self.completions if not c.success]
-    
-    def reset(self):
-        """Reset all metrics"""
-        self.completions.clear()
-        self.total_cost = 0.0
-        self.total_tokens = 0
-        self.total_prompt_tokens = 0
-        self.total_completion_tokens = 0
-        self.model_usage.clear()
-        self.start_time = time.time()
-    
-    def export_to_dict(self) -> Dict[str, any]:
-        """Export metrics to dictionary for serialization"""
-        return {
-            'completions': [
-                {
-                    'model': c.model,
-                    'timestamp': c.timestamp,
-                    'prompt_tokens': c.prompt_tokens,
-                    'completion_tokens': c.completion_tokens,
-                    'total_tokens': c.total_tokens,
-                    'cost': c.cost,
-                    'duration': c.duration,
-                    'success': c.success,
-                    'error': c.error
-                }
-                for c in self.completions
+            'accumulated_cost': self._accumulated_cost,
+            'accumulated_token_usage': self.accumulated_token_usage.model_dump(),
+            'costs': [cost.model_dump() for cost in self._costs],
+            'response_latencies': [
+                latency.model_dump() for latency in self._response_latencies
             ],
-            'summary': self.get_summary()
+            'token_usages': [usage.model_dump() for usage in self._token_usages],
         }
-    
-    def __repr__(self):
-        return (
-            f"Metrics(completions={len(self.completions)}, "
-            f"total_cost=${self.total_cost:.4f}, "
-            f"total_tokens={self.total_tokens})"
+
+    def reset(self) -> None:
+        self._accumulated_cost = 0.0
+        self._costs = []
+        self._response_latencies = []
+        self._token_usages = []
+        # Reset accumulated token usage with a new instance
+        self._accumulated_token_usage = TokenUsage(
+            model=self.model_name,
+            prompt_tokens=0,
+            completion_tokens=0,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+            context_window=0,
+            response_id='',
         )
+
+    def log(self) -> str:
+        """Log the metrics."""
+        metrics = self.get()
+        logs = ''
+        for key, value in metrics.items():
+            logs += f'{key}: {value}\n'
+        return logs
+
+    def copy(self) -> 'Metrics':
+        """Create a deep copy of the Metrics object."""
+        return copy.deepcopy(self)
+
+    def __repr__(self) -> str:
+        return f'Metrics({self.get()}'

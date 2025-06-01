@@ -1,685 +1,510 @@
-"""
-GitHub service implementation for OpenReplica matching OpenHands exactly
-"""
-from __future__ import annotations
-
-import base64
+import json
+import os
 from datetime import datetime
 from typing import Any
+
 import httpx
 from pydantic import SecretStr
 
-from app.core.logging import get_logger
+from app.core.logger import openreplica_logger as logger
+from app.integrations.github.queries import (
+    suggested_task_issue_graphql_query,
+    suggested_task_pr_graphql_query,
+)
 from app.integrations.service_types import (
-    AuthenticationError,
+    BaseGitService,
     Branch,
-    Comment,
-    Commit,
     GitService,
-    Issue,
-    PullRequest,
-    Release,
+    ProviderType,
     Repository,
-    RepositoryNotFoundError,
+    RequestMethod,
     SuggestedTask,
+    TaskType,
+    UnknownException,
     User,
 )
+from app.server.types import AppMode
+from app.utils.import_utils import get_impl
 
-logger = get_logger(__name__)
 
+class GitHubService(BaseGitService, GitService):
+    BASE_URL = 'https://api.github.com'
+    token: SecretStr = SecretStr('')
+    refresh = False
 
-class GithubServiceImpl(GitService):
-    """GitHub service implementation"""
-    
-    def __init__(self, token: SecretStr | str, host: str | None = None):
-        if isinstance(token, str):
-            self.token = SecretStr(token)
-        else:
+    def __init__(
+        self,
+        user_id: str | None = None,
+        external_auth_id: str | None = None,
+        external_auth_token: SecretStr | None = None,
+        token: SecretStr | None = None,
+        external_token_manager: bool = False,
+        base_domain: str | None = None,
+    ):
+        self.user_id = user_id
+        self.external_token_manager = external_token_manager
+
+        if token:
             self.token = token
-        self.host = host or "api.github.com"
-        self.base_url = f"https://{self.host}" if not self.host.startswith("http") else self.host
-        if not self.base_url.endswith("/api/v3"):
-            self.base_url += "/api/v3" if "github.com" in self.base_url else "/api/v3"
-        
-        self.headers = {
-            "Authorization": f"Bearer {self.token.get_secret_value()}",
-            "Accept": "application/vnd.github.v3+json",
-            "X-GitHub-Api-Version": "2022-11-28",
+
+        if base_domain and base_domain != 'github.com':
+            self.BASE_URL = f'https://{base_domain}/api/v3'
+
+        self.external_auth_id = external_auth_id
+        self.external_auth_token = external_auth_token
+
+    @property
+    def provider(self) -> str:
+        return ProviderType.GITHUB.value
+
+    async def _get_github_headers(self) -> dict:
+        """Retrieve the GH Token from settings store to construct the headers."""
+        if not self.token:
+            self.token = await self.get_latest_token()
+
+        return {
+            'Authorization': f'Bearer {self.token.get_secret_value() if self.token else ""}',
+            'Accept': 'application/vnd.github.v3+json',
         }
-    
+
+    def _has_token_expired(self, status_code: int) -> bool:
+        return status_code == 401
+
+    async def get_latest_token(self) -> SecretStr | None:
+        return self.token
+
     async def _make_request(
-        self, 
-        method: str, 
-        endpoint: str, 
-        params: dict[str, Any] | None = None,
-        json_data: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        """Make HTTP request to GitHub API"""
-        url = f"{self.base_url}/{endpoint.lstrip('/')}"
-        
+        self,
+        url: str,
+        params: dict | None = None,
+        method: RequestMethod = RequestMethod.GET,
+    ) -> tuple[Any, dict]:
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.request(
-                    method=method,
+                github_headers = await self._get_github_headers()
+
+                # Make initial request
+                response = await self.execute_request(
+                    client=client,
                     url=url,
-                    headers=self.headers,
+                    headers=github_headers,
                     params=params,
-                    json=json_data,
-                    timeout=30.0
+                    method=method,
                 )
-                
-                if response.status_code == 401:
-                    raise AuthenticationError("Invalid GitHub token")
-                elif response.status_code == 404:
-                    raise RepositoryNotFoundError("Repository not found")
-                
+
+                # Handle token refresh if needed
+                if self.refresh and self._has_token_expired(response.status_code):
+                    await self.get_latest_token()
+                    github_headers = await self._get_github_headers()
+                    response = await self.execute_request(
+                        client=client,
+                        url=url,
+                        headers=github_headers,
+                        params=params,
+                        method=method,
+                    )
+
                 response.raise_for_status()
-                return response.json()
-                
+                headers = {}
+                if 'Link' in response.headers:
+                    headers['Link'] = response.headers['Link']
+
+                return response.json(), headers
+
         except httpx.HTTPStatusError as e:
-            logger.error(f"GitHub API error: {e.response.status_code} - {e.response.text}")
-            raise
-        except Exception as e:
-            logger.error(f"GitHub API request failed: {e}")
-            raise
-    
+            raise self.handle_http_status_error(e)
+        except httpx.HTTPError as e:
+            raise self.handle_http_error(e)
+
     async def get_user(self) -> User:
-        """Get authenticated user information"""
-        data = await self._make_request("GET", "/user")
-        
+        url = f'{self.BASE_URL}/user'
+        response, _ = await self._make_request(url)
+
         return User(
-            id=data["id"],
-            username=data["login"],
-            name=data.get("name"),
-            email=data.get("email"),
-            avatar_url=data.get("avatar_url"),
-            profile_url=data.get("html_url"),
-            bio=data.get("bio"),
-            company=data.get("company"),
-            location=data.get("location"),
-            blog=data.get("blog"),
-            public_repos=data.get("public_repos"),
-            followers=data.get("followers"),
-            following=data.get("following"),
-            created_at=datetime.fromisoformat(data["created_at"].replace("Z", "+00:00")) if data.get("created_at") else None,
-            updated_at=datetime.fromisoformat(data["updated_at"].replace("Z", "+00:00")) if data.get("updated_at") else None,
+            id=response.get('id'),
+            login=response.get('login'),
+            avatar_url=response.get('avatar_url'),
+            company=response.get('company'),
+            name=response.get('name'),
+            email=response.get('email'),
         )
-    
-    async def list_repositories(
-        self, 
-        visibility: str = "all",
-        sort: str = "updated",
-        per_page: int = 30,
-        page: int = 1
+
+    async def verify_access(self) -> bool:
+        """Verify if the token is valid by making a simple request."""
+        url = f'{self.BASE_URL}'
+        await self._make_request(url)
+        return True
+
+    async def _fetch_paginated_repos(
+        self, url: str, params: dict, max_repos: int, extract_key: str | None = None
+    ) -> list[dict]:
+        """
+        Fetch repositories with pagination support.
+
+        Args:
+            url: The API endpoint URL
+            params: Query parameters for the request
+            max_repos: Maximum number of repositories to fetch
+            extract_key: If provided, extract repositories from this key in the response
+
+        Returns:
+            List of repository dictionaries
+        """
+        repos: list[dict] = []
+        page = 1
+
+        while len(repos) < max_repos:
+            page_params = {**params, 'page': str(page)}
+            response, headers = await self._make_request(url, page_params)
+
+            # Extract repositories from response
+            page_repos = response.get(extract_key, []) if extract_key else response
+
+            if not page_repos:  # No more repositories
+                break
+
+            repos.extend(page_repos)
+            page += 1
+
+            # Check if we've reached the last page
+            link_header = headers.get('Link', '')
+            if 'rel="next"' not in link_header:
+                break
+
+        return repos[:max_repos]  # Trim to max_repos if needed
+
+    def parse_pushed_at_date(self, repo):
+        ts = repo.get('pushed_at')
+        return datetime.strptime(ts, '%Y-%m-%dT%H:%M:%SZ') if ts else datetime.min
+
+    async def get_repositories(self, sort: str, app_mode: AppMode) -> list[Repository]:
+        MAX_REPOS = 1000
+        PER_PAGE = 100  # Maximum allowed by GitHub API
+        all_repos: list[dict] = []
+
+        if app_mode == AppMode.SAAS:
+            # Get all installation IDs and fetch repos for each one
+            installation_ids = await self.get_installation_ids()
+
+            # Iterate through each installation ID
+            for installation_id in installation_ids:
+                params = {'per_page': str(PER_PAGE)}
+                url = (
+                    f'{self.BASE_URL}/user/installations/{installation_id}/repositories'
+                )
+
+                # Fetch repositories for this installation
+                installation_repos = await self._fetch_paginated_repos(
+                    url, params, MAX_REPOS - len(all_repos), extract_key='repositories'
+                )
+
+                all_repos.extend(installation_repos)
+
+                # If we've already reached MAX_REPOS, no need to check other installations
+                if len(all_repos) >= MAX_REPOS:
+                    break
+
+            if sort == 'pushed':
+                all_repos.sort(key=self.parse_pushed_at_date, reverse=True)
+        else:
+            # Original behavior for non-SaaS mode
+            params = {'per_page': str(PER_PAGE), 'sort': sort}
+            url = f'{self.BASE_URL}/user/repos'
+
+            # Fetch user repositories
+            all_repos = await self._fetch_paginated_repos(url, params, MAX_REPOS)
+
+        # Convert to Repository objects
+        return [
+            Repository(
+                id=repo.get('id'),
+                full_name=repo.get('full_name'),
+                stargazers_count=repo.get('stargazers_count'),
+                git_provider=ProviderType.GITHUB,
+                is_public=not repo.get('private', True),
+            )
+            for repo in all_repos
+        ]
+
+    async def get_installation_ids(self) -> list[int]:
+        url = f'{self.BASE_URL}/user/installations'
+        response, _ = await self._make_request(url)
+        installations = response.get('installations', [])
+        return [i['id'] for i in installations]
+
+    async def search_repositories(
+        self, query: str, per_page: int, sort: str, order: str
     ) -> list[Repository]:
-        """List user repositories"""
+        url = f'{self.BASE_URL}/search/repositories'
+        # Add is:public to the query to ensure we only search for public repositories
+        query_with_visibility = f'{query} is:public'
         params = {
-            "visibility": visibility,
-            "sort": sort,
-            "per_page": per_page,
-            "page": page
+            'q': query_with_visibility,
+            'per_page': per_page,
+            'sort': sort,
+            'order': order,
         }
-        
-        data = await self._make_request("GET", "/user/repos", params=params)
-        
-        repositories = []
-        for repo_data in data:
-            repositories.append(self._parse_repository(repo_data))
-        
-        return repositories
-    
-    async def get_repository(self, repo_name: str) -> Repository:
-        """Get repository information"""
-        data = await self._make_request("GET", f"/repos/{repo_name}")
-        return self._parse_repository(data)
-    
-    async def create_repository(
-        self, 
-        name: str, 
-        description: str | None = None,
-        private: bool = True,
-        auto_init: bool = False
+
+        response, _ = await self._make_request(url, params)
+        repo_items = response.get('items', [])
+
+        repos = [
+            Repository(
+                id=repo.get('id'),
+                full_name=repo.get('full_name'),
+                stargazers_count=repo.get('stargazers_count'),
+                git_provider=ProviderType.GITHUB,
+                is_public=True,
+            )
+            for repo in repo_items
+        ]
+
+        return repos
+
+    async def execute_graphql_query(
+        self, query: str, variables: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Execute a GraphQL query against the GitHub API."""
+        try:
+            async with httpx.AsyncClient() as client:
+                github_headers = await self._get_github_headers()
+                response = await client.post(
+                    f'{self.BASE_URL}/graphql',
+                    headers=github_headers,
+                    json={'query': query, 'variables': variables},
+                )
+                response.raise_for_status()
+
+                result = response.json()
+                if 'errors' in result:
+                    raise UnknownException(
+                        f'GraphQL query error: {json.dumps(result["errors"])}'
+                    )
+
+                return dict(result)
+
+        except httpx.HTTPStatusError as e:
+            raise self.handle_http_status_error(e)
+        except httpx.HTTPError as e:
+            raise self.handle_http_error(e)
+
+    async def get_suggested_tasks(self) -> list[SuggestedTask]:
+        """Get suggested tasks for the authenticated user across all repositories.
+
+        Returns:
+        - PRs authored by the user.
+        - Issues assigned to the user.
+
+        Note: Queries are split to avoid timeout issues.
+        """
+        # Get user info to use in queries
+        user = await self.get_user()
+        login = user.login
+        tasks: list[SuggestedTask] = []
+        variables = {'login': login}
+
+        try:
+            pr_response = await self.execute_graphql_query(
+                suggested_task_pr_graphql_query, variables
+            )
+            pr_data = pr_response['data']['user']
+
+            # Process pull requests
+            for pr in pr_data['pullRequests']['nodes']:
+                repo_name = pr['repository']['nameWithOwner']
+
+                # Start with default task type
+                task_type = TaskType.OPEN_PR
+
+                # Check for specific states
+                if pr['mergeable'] == 'CONFLICTING':
+                    task_type = TaskType.MERGE_CONFLICTS
+                elif (
+                    pr['commits']['nodes']
+                    and pr['commits']['nodes'][0]['commit']['statusCheckRollup']
+                    and pr['commits']['nodes'][0]['commit']['statusCheckRollup'][
+                        'state'
+                    ]
+                    == 'FAILURE'
+                ):
+                    task_type = TaskType.FAILING_CHECKS
+                elif any(
+                    review['state'] in ['CHANGES_REQUESTED', 'COMMENTED']
+                    for review in pr['reviews']['nodes']
+                ):
+                    task_type = TaskType.UNRESOLVED_COMMENTS
+
+                # Only add the task if it's not OPEN_PR
+                if task_type != TaskType.OPEN_PR:
+                    tasks.append(
+                        SuggestedTask(
+                            git_provider=ProviderType.GITHUB,
+                            task_type=task_type,
+                            repo=repo_name,
+                            issue_number=pr['number'],
+                            title=pr['title'],
+                        )
+                    )
+
+        except Exception as e:
+            logger.info(
+                f'Error fetching suggested task for PRs: {e}',
+                extra={
+                    'signal': 'github_suggested_tasks',
+                    'user_id': self.external_auth_id,
+                },
+            )
+
+        try:
+            # Execute issue query
+            issue_response = await self.execute_graphql_query(
+                suggested_task_issue_graphql_query, variables
+            )
+            issue_data = issue_response['data']['user']
+
+            # Process issues
+            for issue in issue_data['issues']['nodes']:
+                repo_name = issue['repository']['nameWithOwner']
+                tasks.append(
+                    SuggestedTask(
+                        git_provider=ProviderType.GITHUB,
+                        task_type=TaskType.OPEN_ISSUE,
+                        repo=repo_name,
+                        issue_number=issue['number'],
+                        title=issue['title'],
+                    )
+                )
+
+            return tasks
+
+        except Exception as e:
+            logger.info(
+                f'Error fetching suggested task for issues: {e}',
+                extra={
+                    'signal': 'github_suggested_tasks',
+                    'user_id': self.external_auth_id,
+                },
+            )
+
+        return tasks
+
+    async def get_repository_details_from_repo_name(
+        self, repository: str
     ) -> Repository:
-        """Create a new repository"""
-        json_data = {
-            "name": name,
-            "description": description,
-            "private": private,
-            "auto_init": auto_init
-        }
-        
-        data = await self._make_request("POST", "/user/repos", json_data=json_data)
-        return self._parse_repository(data)
-    
-    async def fork_repository(self, repo_name: str) -> Repository:
-        """Fork a repository"""
-        data = await self._make_request("POST", f"/repos/{repo_name}/forks")
-        return self._parse_repository(data)
-    
-    async def list_branches(self, repo_name: str) -> list[Branch]:
-        """List repository branches"""
-        data = await self._make_request("GET", f"/repos/{repo_name}/branches")
-        
-        branches = []
-        for branch_data in data:
-            branches.append(Branch(
-                name=branch_data["name"],
-                sha=branch_data["commit"]["sha"],
-                protected=branch_data.get("protected", False),
-                protection_url=branch_data.get("protection_url"),
-                commit=branch_data.get("commit")
-            ))
-        
-        return branches
-    
-    async def get_branch(self, repo_name: str, branch_name: str) -> Branch:
-        """Get branch information"""
-        data = await self._make_request("GET", f"/repos/{repo_name}/branches/{branch_name}")
-        
-        return Branch(
-            name=data["name"],
-            sha=data["commit"]["sha"],
-            protected=data.get("protected", False),
-            protection_url=data.get("protection_url"),
-            commit=data.get("commit")
+        url = f'{self.BASE_URL}/repos/{repository}'
+        repo, _ = await self._make_request(url)
+
+        return Repository(
+            id=repo.get('id'),
+            full_name=repo.get('full_name'),
+            stargazers_count=repo.get('stargazers_count'),
+            git_provider=ProviderType.GITHUB,
+            is_public=not repo.get('private', True),
         )
-    
-    async def create_branch(
-        self, 
-        repo_name: str, 
-        branch_name: str, 
-        from_branch: str = "main"
-    ) -> Branch:
-        """Create a new branch"""
-        # Get the SHA of the source branch
-        source_branch = await self.get_branch(repo_name, from_branch)
-        
-        json_data = {
-            "ref": f"refs/heads/{branch_name}",
-            "sha": source_branch.sha
-        }
-        
-        await self._make_request("POST", f"/repos/{repo_name}/git/refs", json_data=json_data)
-        
-        # Return the new branch info
-        return await self.get_branch(repo_name, branch_name)
-    
-    async def list_pull_requests(
+
+    async def get_branches(self, repository: str) -> list[Branch]:
+        """Get branches for a repository"""
+        url = f'{self.BASE_URL}/repos/{repository}/branches'
+
+        # Set maximum branches to fetch (10 pages with 100 per page)
+        MAX_BRANCHES = 1000
+        PER_PAGE = 100
+
+        all_branches: list[Branch] = []
+        page = 1
+
+        # Fetch up to 10 pages of branches
+        while page <= 10 and len(all_branches) < MAX_BRANCHES:
+            params = {'per_page': str(PER_PAGE), 'page': str(page)}
+            response, headers = await self._make_request(url, params)
+
+            if not response:  # No more branches
+                break
+
+            for branch_data in response:
+                # Extract the last commit date if available
+                last_push_date = None
+                if branch_data.get('commit') and branch_data['commit'].get('commit'):
+                    commit_info = branch_data['commit']['commit']
+                    if commit_info.get('committer') and commit_info['committer'].get(
+                        'date'
+                    ):
+                        last_push_date = commit_info['committer']['date']
+
+                branch = Branch(
+                    name=branch_data.get('name'),
+                    commit_sha=branch_data.get('commit', {}).get('sha', ''),
+                    protected=branch_data.get('protected', False),
+                    last_push_date=last_push_date,
+                )
+                all_branches.append(branch)
+
+            page += 1
+
+            # Check if we've reached the last page
+            link_header = headers.get('Link', '')
+            if 'rel="next"' not in link_header:
+                break
+
+        return all_branches
+
+    async def create_pr(
         self,
         repo_name: str,
-        state: str = "open",
-        sort: str = "created",
-        direction: str = "desc"
-    ) -> list[PullRequest]:
-        """List pull requests"""
-        params = {
-            "state": state,
-            "sort": sort,
-            "direction": direction
-        }
-        
-        data = await self._make_request("GET", f"/repos/{repo_name}/pulls", params=params)
-        
-        pull_requests = []
-        for pr_data in data:
-            pull_requests.append(self._parse_pull_request(pr_data))
-        
-        return pull_requests
-    
-    async def get_pull_request(self, repo_name: str, pr_number: int) -> PullRequest:
-        """Get pull request information"""
-        data = await self._make_request("GET", f"/repos/{repo_name}/pulls/{pr_number}")
-        return self._parse_pull_request(data)
-    
-    async def create_pull_request(
-        self,
-        repo_name: str,
-        title: str,
-        body: str,
-        head_branch: str,
-        base_branch: str = "main",
-        draft: bool = False
-    ) -> PullRequest:
-        """Create a pull request"""
-        json_data = {
-            "title": title,
-            "body": body,
-            "head": head_branch,
-            "base": base_branch,
-            "draft": draft
-        }
-        
-        data = await self._make_request("POST", f"/repos/{repo_name}/pulls", json_data=json_data)
-        return self._parse_pull_request(data)
-    
-    async def list_issues(
-        self,
-        repo_name: str,
-        state: str = "open",
-        sort: str = "created",
-        direction: str = "desc"
-    ) -> list[Issue]:
-        """List issues"""
-        params = {
-            "state": state,
-            "sort": sort,
-            "direction": direction
-        }
-        
-        data = await self._make_request("GET", f"/repos/{repo_name}/issues", params=params)
-        
-        issues = []
-        for issue_data in data:
-            # Skip pull requests (GitHub includes them in issues)
-            if "pull_request" not in issue_data:
-                issues.append(self._parse_issue(issue_data))
-        
-        return issues
-    
-    async def get_issue(self, repo_name: str, issue_number: int) -> Issue:
-        """Get issue information"""
-        data = await self._make_request("GET", f"/repos/{repo_name}/issues/{issue_number}")
-        return self._parse_issue(data)
-    
-    async def create_issue(
-        self,
-        repo_name: str,
+        source_branch: str,
+        target_branch: str,
         title: str,
         body: str | None = None,
-        labels: list[str] | None = None,
-        assignees: list[str] | None = None
-    ) -> Issue:
-        """Create an issue"""
-        json_data = {
-            "title": title,
-            "body": body,
-            "labels": labels or [],
-            "assignees": assignees or []
-        }
-        
-        data = await self._make_request("POST", f"/repos/{repo_name}/issues", json_data=json_data)
-        return self._parse_issue(data)
-    
-    async def list_commits(
-        self,
-        repo_name: str,
-        branch: str | None = None,
-        since: datetime | None = None,
-        until: datetime | None = None
-    ) -> list[Commit]:
-        """List repository commits"""
-        params = {}
-        if branch:
-            params["sha"] = branch
-        if since:
-            params["since"] = since.isoformat()
-        if until:
-            params["until"] = until.isoformat()
-        
-        data = await self._make_request("GET", f"/repos/{repo_name}/commits", params=params)
-        
-        commits = []
-        for commit_data in data:
-            commits.append(self._parse_commit(commit_data))
-        
-        return commits
-    
-    async def get_commit(self, repo_name: str, sha: str) -> Commit:
-        """Get commit information"""
-        data = await self._make_request("GET", f"/repos/{repo_name}/commits/{sha}")
-        return self._parse_commit(data)
-    
-    async def list_releases(self, repo_name: str) -> list[Release]:
-        """List repository releases"""
-        data = await self._make_request("GET", f"/repos/{repo_name}/releases")
-        
-        releases = []
-        for release_data in data:
-            releases.append(self._parse_release(release_data))
-        
-        return releases
-    
-    async def get_release(self, repo_name: str, release_id: str) -> Release:
-        """Get release information"""
-        data = await self._make_request("GET", f"/repos/{repo_name}/releases/{release_id}")
-        return self._parse_release(data)
-    
-    async def get_file_content(
-        self, 
-        repo_name: str, 
-        file_path: str, 
-        branch: str | None = None
-    ) -> dict[str, Any]:
-        """Get file content from repository"""
-        params = {}
-        if branch:
-            params["ref"] = branch
-        
-        data = await self._make_request("GET", f"/repos/{repo_name}/contents/{file_path}", params=params)
-        
-        # Decode base64 content if it's a file
-        if data.get("type") == "file" and data.get("content"):
-            content = base64.b64decode(data["content"]).decode("utf-8")
-            data["decoded_content"] = content
-        
-        return data
-    
-    async def create_file(
-        self,
-        repo_name: str,
-        file_path: str,
-        content: str,
-        message: str,
-        branch: str | None = None
-    ) -> dict[str, Any]:
-        """Create a file in repository"""
-        encoded_content = base64.b64encode(content.encode("utf-8")).decode("ascii")
-        
-        json_data = {
-            "message": message,
-            "content": encoded_content
-        }
-        
-        if branch:
-            json_data["branch"] = branch
-        
-        return await self._make_request("PUT", f"/repos/{repo_name}/contents/{file_path}", json_data=json_data)
-    
-    async def update_file(
-        self,
-        repo_name: str,
-        file_path: str,
-        content: str,
-        message: str,
-        sha: str,
-        branch: str | None = None
-    ) -> dict[str, Any]:
-        """Update a file in repository"""
-        encoded_content = base64.b64encode(content.encode("utf-8")).decode("ascii")
-        
-        json_data = {
-            "message": message,
-            "content": encoded_content,
-            "sha": sha
-        }
-        
-        if branch:
-            json_data["branch"] = branch
-        
-        return await self._make_request("PUT", f"/repos/{repo_name}/contents/{file_path}", json_data=json_data)
-    
-    async def delete_file(
-        self,
-        repo_name: str,
-        file_path: str,
-        message: str,
-        sha: str,
-        branch: str | None = None
-    ) -> dict[str, Any]:
-        """Delete a file from repository"""
-        json_data = {
-            "message": message,
-            "sha": sha
-        }
-        
-        if branch:
-            json_data["branch"] = branch
-        
-        return await self._make_request("DELETE", f"/repos/{repo_name}/contents/{file_path}", json_data=json_data)
-    
-    async def get_suggested_tasks(self, repo_name: str) -> list[SuggestedTask]:
-        """Get AI-suggested tasks for the repository"""
-        # Get repository info and recent issues/PRs to suggest tasks
+        draft: bool = True,
+    ) -> str:
+        """
+        Creates a PR using user credentials
+
+        Args:
+            repo_name: The full name of the repository (owner/repo)
+            source_branch: The name of the branch where your changes are implemented
+            target_branch: The name of the branch you want the changes pulled into
+            title: The title of the pull request (optional, defaults to a generic title)
+            body: The body/description of the pull request (optional)
+            draft: Whether to create the PR as a draft (optional, defaults to False)
+
+        Returns:
+            - PR URL when successful
+            - Error message when unsuccessful
+        """
         try:
-            repo = await self.get_repository(repo_name)
-            issues = await self.list_issues(repo_name, state="open")
-            
-            suggested_tasks = []
-            
-            # Suggest documentation if README is minimal
-            if repo.description and len(repo.description) < 100:
-                suggested_tasks.append(SuggestedTask(
-                    title="Improve project documentation",
-                    description="Expand the README with detailed installation, usage, and contribution guidelines",
-                    type="documentation",
-                    priority="medium",
-                    estimated_effort="medium",
-                    files_to_modify=["README.md"]
-                ))
-            
-            # Suggest tests if no test files found
-            suggested_tasks.append(SuggestedTask(
-                title="Add comprehensive test coverage",
-                description="Implement unit tests and integration tests to ensure code quality",
-                type="improvement",
-                priority="high",
-                estimated_effort="large",
-                files_to_modify=["tests/"]
-            ))
-            
-            # Suggest CI/CD if no workflows
-            suggested_tasks.append(SuggestedTask(
-                title="Setup CI/CD pipeline",
-                description="Add GitHub Actions workflow for automated testing and deployment",
-                type="improvement",
-                priority="medium",
-                estimated_effort="medium",
-                files_to_modify=[".github/workflows/"]
-            ))
-            
-            # Suggest issue templates
-            suggested_tasks.append(SuggestedTask(
-                title="Add issue and PR templates",
-                description="Create templates to standardize bug reports and feature requests",
-                type="improvement",
-                priority="low",
-                estimated_effort="small",
-                files_to_modify=[".github/ISSUE_TEMPLATE/", ".github/pull_request_template.md"]
-            ))
-            
-            return suggested_tasks[:5]  # Return top 5 suggestions
-            
-        except Exception as e:
-            logger.warning(f"Failed to generate suggested tasks: {e}")
-            return []
-    
-    async def search_repositories(
-        self,
-        query: str,
-        sort: str = "stars",
-        order: str = "desc",
-        per_page: int = 30
-    ) -> list[Repository]:
-        """Search repositories"""
-        params = {
-            "q": query,
-            "sort": sort,
-            "order": order,
-            "per_page": per_page
-        }
-        
-        data = await self._make_request("GET", "/search/repositories", params=params)
-        
-        repositories = []
-        for repo_data in data.get("items", []):
-            repositories.append(self._parse_repository(repo_data))
-        
-        return repositories
-    
-    async def search_code(
-        self,
-        query: str,
-        repo_name: str | None = None,
-        sort: str = "indexed",
-        order: str = "desc"
-    ) -> dict[str, Any]:
-        """Search code"""
-        search_query = query
-        if repo_name:
-            search_query += f" repo:{repo_name}"
-        
-        params = {
-            "q": search_query,
-            "sort": sort,
-            "order": order
-        }
-        
-        return await self._make_request("GET", "/search/code", params=params)
-    
-    async def get_repository_stats(self, repo_name: str) -> dict[str, Any]:
-        """Get repository statistics"""
-        # Get various stats from different endpoints
-        repo = await self.get_repository(repo_name)
-        languages = await self.get_repository_languages(repo_name)
-        
-        try:
-            # Get contributor stats
-            contributors = await self._make_request("GET", f"/repos/{repo_name}/contributors")
-            commit_activity = await self._make_request("GET", f"/repos/{repo_name}/stats/commit_activity")
-        except Exception:
-            contributors = []
-            commit_activity = []
-        
-        return {
-            "basic_stats": {
-                "stars": repo.stargazers_count,
-                "forks": repo.forks_count,
-                "watchers": repo.watchers_count,
-                "open_issues": repo.open_issues_count,
-                "size": repo.size
-            },
-            "languages": languages,
-            "contributors": len(contributors),
-            "commit_activity": commit_activity
-        }
-    
-    async def get_repository_languages(self, repo_name: str) -> dict[str, int]:
-        """Get repository programming languages"""
-        return await self._make_request("GET", f"/repos/{repo_name}/languages")
-    
-    async def get_repository_topics(self, repo_name: str) -> list[str]:
-        """Get repository topics/tags"""
-        headers = {**self.headers, "Accept": "application/vnd.github.mercy-preview+json"}
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{self.base_url}/repos/{repo_name}/topics",
-                headers=headers
+            url = f'{self.BASE_URL}/repos/{repo_name}/pulls'
+
+            # Set default body if none provided
+            if not body:
+                body = f'Merging changes from {source_branch} into {target_branch}'
+
+            # Prepare the request payload
+            payload = {
+                'title': title,
+                'head': source_branch,
+                'base': target_branch,
+                'body': body,
+                'draft': draft,
+            }
+
+            # Make the POST request to create the PR
+            response, _ = await self._make_request(
+                url=url, params=payload, method=RequestMethod.POST
             )
-            response.raise_for_status()
-            data = response.json()
-        
-        return data.get("names", [])
-    
-    def _parse_user(self, user_data: dict[str, Any]) -> User:
-        """Parse user data from GitHub API"""
-        return User(
-            id=user_data["id"],
-            username=user_data["login"],
-            name=user_data.get("name"),
-            email=user_data.get("email"),
-            avatar_url=user_data.get("avatar_url"),
-            profile_url=user_data.get("html_url")
-        )
-    
-    def _parse_repository(self, repo_data: dict[str, Any]) -> Repository:
-        """Parse repository data from GitHub API"""
-        return Repository(
-            id=repo_data["id"],
-            name=repo_data["name"],
-            full_name=repo_data["full_name"],
-            description=repo_data.get("description"),
-            private=repo_data["private"],
-            fork=repo_data["fork"],
-            archived=repo_data.get("archived", False),
-            disabled=repo_data.get("disabled", False),
-            html_url=repo_data["html_url"],
-            clone_url=repo_data["clone_url"],
-            ssh_url=repo_data.get("ssh_url"),
-            default_branch=repo_data.get("default_branch", "main"),
-            language=repo_data.get("language"),
-            size=repo_data.get("size"),
-            stargazers_count=repo_data.get("stargazers_count"),
-            watchers_count=repo_data.get("watchers_count"),
-            forks_count=repo_data.get("forks_count"),
-            open_issues_count=repo_data.get("open_issues_count"),
-            license=repo_data.get("license", {}).get("spdx_id") if repo_data.get("license") else None,
-            owner=self._parse_user(repo_data["owner"]),
-            created_at=datetime.fromisoformat(repo_data["created_at"].replace("Z", "+00:00")) if repo_data.get("created_at") else None,
-            updated_at=datetime.fromisoformat(repo_data["updated_at"].replace("Z", "+00:00")) if repo_data.get("updated_at") else None,
-            pushed_at=datetime.fromisoformat(repo_data["pushed_at"].replace("Z", "+00:00")) if repo_data.get("pushed_at") else None,
-        )
-    
-    def _parse_pull_request(self, pr_data: dict[str, Any]) -> PullRequest:
-        """Parse pull request data from GitHub API"""
-        return PullRequest(
-            id=pr_data["id"],
-            number=pr_data["number"],
-            title=pr_data["title"],
-            body=pr_data.get("body"),
-            state=pr_data["state"],
-            draft=pr_data.get("draft", False),
-            mergeable=pr_data.get("mergeable"),
-            rebaseable=pr_data.get("rebaseable"),
-            head=pr_data["head"],
-            base=pr_data["base"],
-            user=self._parse_user(pr_data["user"]),
-            html_url=pr_data["html_url"],
-            diff_url=pr_data.get("diff_url"),
-            patch_url=pr_data.get("patch_url"),
-            created_at=datetime.fromisoformat(pr_data["created_at"].replace("Z", "+00:00")) if pr_data.get("created_at") else None,
-            updated_at=datetime.fromisoformat(pr_data["updated_at"].replace("Z", "+00:00")) if pr_data.get("updated_at") else None,
-            closed_at=datetime.fromisoformat(pr_data["closed_at"].replace("Z", "+00:00")) if pr_data.get("closed_at") else None,
-            merged_at=datetime.fromisoformat(pr_data["merged_at"].replace("Z", "+00:00")) if pr_data.get("merged_at") else None,
-        )
-    
-    def _parse_issue(self, issue_data: dict[str, Any]) -> Issue:
-        """Parse issue data from GitHub API"""
-        return Issue(
-            id=issue_data["id"],
-            number=issue_data["number"],
-            title=issue_data["title"],
-            body=issue_data.get("body"),
-            state=issue_data["state"],
-            locked=issue_data.get("locked", False),
-            user=self._parse_user(issue_data["user"]),
-            labels=issue_data.get("labels", []),
-            comments=issue_data.get("comments"),
-            html_url=issue_data["html_url"],
-            created_at=datetime.fromisoformat(issue_data["created_at"].replace("Z", "+00:00")) if issue_data.get("created_at") else None,
-            updated_at=datetime.fromisoformat(issue_data["updated_at"].replace("Z", "+00:00")) if issue_data.get("updated_at") else None,
-            closed_at=datetime.fromisoformat(issue_data["closed_at"].replace("Z", "+00:00")) if issue_data.get("closed_at") else None,
-        )
-    
-    def _parse_commit(self, commit_data: dict[str, Any]) -> Commit:
-        """Parse commit data from GitHub API"""
-        return Commit(
-            sha=commit_data["sha"],
-            message=commit_data["commit"]["message"],
-            author=commit_data["commit"]["author"],
-            committer=commit_data["commit"]["committer"],
-            tree=commit_data["commit"]["tree"],
-            parents=commit_data.get("parents"),
-            html_url=commit_data.get("html_url"),
-            stats=commit_data.get("stats"),
-            files=commit_data.get("files")
-        )
-    
-    def _parse_release(self, release_data: dict[str, Any]) -> Release:
-        """Parse release data from GitHub API"""
-        return Release(
-            id=release_data["id"],
-            tag_name=release_data["tag_name"],
-            name=release_data.get("name"),
-            body=release_data.get("body"),
-            draft=release_data.get("draft", False),
-            prerelease=release_data.get("prerelease", False),
-            target_commitish=release_data.get("target_commitish"),
-            html_url=release_data.get("html_url"),
-            tarball_url=release_data.get("tarball_url"),
-            zipball_url=release_data.get("zipball_url"),
-            assets=release_data.get("assets", []),
-            author=self._parse_user(release_data["author"]) if release_data.get("author") else None,
-            created_at=datetime.fromisoformat(release_data["created_at"].replace("Z", "+00:00")) if release_data.get("created_at") else None,
-            published_at=datetime.fromisoformat(release_data["published_at"].replace("Z", "+00:00")) if release_data.get("published_at") else None,
-        )
+
+            # Return the HTML URL of the created PR
+            if 'html_url' in response:
+                return response['html_url']
+            else:
+                return f'PR created but URL not found in response: {response}'
+
+        except Exception as e:
+            return f'Error creating pull request: {str(e)}'
+
+
+github_service_cls = os.environ.get(
+    'OPENHANDS_GITHUB_SERVICE_CLS',
+    'app.integrations.github.github_service.GitHubService',
+)
+GithubServiceImpl = get_impl(GitHubService, github_service_cls)

@@ -1,6 +1,3 @@
-"""
-Provider integrations for OpenReplica matching OpenHands exactly
-"""
 from __future__ import annotations
 
 from types import MappingProxyType
@@ -13,7 +10,7 @@ from pydantic import (
     WithJsonSchema,
 )
 
-from app.core.logging import get_logger
+from app.core.logger import openreplica_logger as logger
 from app.events.action.action import Action
 from app.events.action.commands import CmdRunAction
 from app.events.stream import EventStream
@@ -29,8 +26,6 @@ from app.integrations.service_types import (
     User,
 )
 from app.server.types import AppMode
-
-logger = get_logger(__name__)
 
 
 class ProviderToken(BaseModel):
@@ -50,7 +45,7 @@ class ProviderToken(BaseModel):
             return token_value
         elif isinstance(token_value, dict):
             token_str = token_value.get('token', '')
-            # Override with empty string if it was set to None
+            # Override with emtpy string if it was set to None
             # Cannot pass None to SecretStr
             if token_str is None:
                 token_str = ''
@@ -73,7 +68,7 @@ class CustomSecret(BaseModel):
 
     @classmethod
     def from_value(cls, secret_value: CustomSecret | dict[str, str]) -> CustomSecret:
-        """Factory method to create a CustomSecret from various input types"""
+        """Factory method to create a ProviderToken from various input types"""
         if isinstance(secret_value, CustomSecret):
             return secret_value
         elif isinstance(secret_value, dict):
@@ -82,7 +77,7 @@ class CustomSecret(BaseModel):
             return cls(secret=SecretStr(secret), description=description)
 
         else:
-            raise ValueError('Unsupported Provider token type')
+            raise ValueError('Unsupport Provider token type')
 
 
 PROVIDER_TOKEN_TYPE = MappingProxyType[ProviderType, ProviderToken]
@@ -103,420 +98,294 @@ class ProviderHandler:
         provider_tokens: PROVIDER_TOKEN_TYPE,
         external_auth_id: str | None = None,
         external_auth_token: SecretStr | None = None,
+        external_token_manager: bool = False,
     ):
-        self.provider_tokens = provider_tokens
+        if not isinstance(provider_tokens, MappingProxyType):
+            raise TypeError(
+                f'provider_tokens must be a MappingProxyType, got {type(provider_tokens).__name__}'
+            )
+
+        self.service_class_map: dict[ProviderType, type[GitService]] = {
+            ProviderType.GITHUB: GithubServiceImpl,
+            ProviderType.GITLAB: GitLabServiceImpl,
+        }
+
         self.external_auth_id = external_auth_id
         self.external_auth_token = external_auth_token
+        self.external_token_manager = external_token_manager
+        self._provider_tokens = provider_tokens
 
-    @overload
-    def get_service(
-        self, provider_type: Literal[ProviderType.GITHUB]
-    ) -> GithubServiceImpl: ...
+    @property
+    def provider_tokens(self) -> PROVIDER_TOKEN_TYPE:
+        """Read-only access to provider tokens."""
+        return self._provider_tokens
 
-    @overload
-    def get_service(
-        self, provider_type: Literal[ProviderType.GITLAB]
-    ) -> GitLabServiceImpl: ...
-
-    @overload
-    def get_service(self, provider_type: ProviderType) -> GitService: ...
-
-    def get_service(self, provider_type: ProviderType) -> GitService:
-        """Get service instance for the given provider type"""
-        if provider_type == ProviderType.GITHUB:
-            token = self._get_token_for_provider(provider_type)
-            return GithubServiceImpl(token)
-        elif provider_type == ProviderType.GITLAB:
-            token = self._get_token_for_provider(provider_type)
-            return GitLabServiceImpl(token)
-        else:
-            raise ValueError(f'Unsupported provider type: {provider_type}')
-
-    def _get_token_for_provider(self, provider_type: ProviderType) -> ProviderToken:
-        """Get token for the specified provider"""
-        if provider_type not in self.provider_tokens:
-            raise AuthenticationError(f'No token found for provider: {provider_type}')
-        
-        return self.provider_tokens[provider_type]
-
-    async def list_repositories(
-        self, provider_type: ProviderType
-    ) -> list[Repository]:
-        """List repositories for the given provider"""
-        service = self.get_service(provider_type)
-        return await service.list_repositories()
-
-    async def get_repository(
-        self, provider_type: ProviderType, repo_name: str
-    ) -> Repository:
-        """Get repository details"""
-        service = self.get_service(provider_type)
-        return await service.get_repository(repo_name)
-
-    async def list_branches(
-        self, provider_type: ProviderType, repo_name: str
-    ) -> list[Branch]:
-        """List branches for the repository"""
-        service = self.get_service(provider_type)
-        return await service.list_branches(repo_name)
-
-    async def get_user(self, provider_type: ProviderType) -> User:
-        """Get user information"""
-        service = self.get_service(provider_type)
-        return await service.get_user()
-
-    async def get_suggested_tasks(
-        self, provider_type: ProviderType, repo_name: str
-    ) -> list[SuggestedTask]:
-        """Get suggested tasks for the repository"""
-        service = self.get_service(provider_type)
-        return await service.get_suggested_tasks(repo_name)
-
-    async def create_repository(
-        self, provider_type: ProviderType, repo_name: str, private: bool = True
-    ) -> Repository:
-        """Create a new repository"""
-        service = self.get_service(provider_type)
-        return await service.create_repository(repo_name, private)
-
-    async def fork_repository(
-        self, provider_type: ProviderType, repo_name: str
-    ) -> Repository:
-        """Fork a repository"""
-        service = self.get_service(provider_type)
-        return await service.fork_repository(repo_name)
-
-    async def create_pull_request(
-        self,
-        provider_type: ProviderType,
-        repo_name: str,
-        title: str,
-        body: str,
-        head_branch: str,
-        base_branch: str = 'main'
-    ) -> dict[str, Any]:
-        """Create a pull request"""
-        service = self.get_service(provider_type)
-        return await service.create_pull_request(
-            repo_name, title, body, head_branch, base_branch
+    def _get_service(self, provider: ProviderType) -> GitService:
+        """Helper method to instantiate a service for a given provider"""
+        token = self.provider_tokens[provider]
+        service_class = self.service_class_map[provider]
+        return service_class(
+            user_id=token.user_id,
+            external_auth_id=self.external_auth_id,
+            external_auth_token=self.external_auth_token,
+            token=token.token,
+            external_token_manager=self.external_token_manager,
         )
 
-    def supports_provider(self, provider_type: ProviderType) -> bool:
-        """Check if provider is supported and has valid token"""
-        try:
-            self._get_token_for_provider(provider_type)
-            return True
-        except AuthenticationError:
-            return False
+    async def get_user(self) -> User:
+        """Get user information from the first available provider"""
+        for provider in self.provider_tokens:
+            try:
+                service = self._get_service(provider)
+                return await service.get_user()
+            except Exception:
+                continue
+        raise AuthenticationError('Need valid provider token')
 
-    def get_supported_providers(self) -> list[ProviderType]:
-        """Get list of supported providers with valid tokens"""
-        return [
-            provider_type
-            for provider_type in ProviderType
-            if self.supports_provider(provider_type)
-        ]
+    async def _get_latest_provider_token(
+        self, provider: ProviderType
+    ) -> SecretStr | None:
+        """Get latest token from service"""
+        service = self._get_service(provider)
+        return await service.get_latest_token()
 
+    async def get_repositories(self, sort: str, app_mode: AppMode) -> list[Repository]:
+        """
+        Get repositories from providers
+        """
 
-# Taviily integration for web search and browsing
-class TavilyIntegration:
-    """Integration with Taviily for web search and AI browsing"""
-    
-    def __init__(self, api_key: SecretStr | None = None):
-        self.api_key = api_key
-        self._client = None
-    
-    def is_configured(self) -> bool:
-        """Check if Taviily is properly configured"""
-        return self.api_key is not None
-    
-    async def search(
+        all_repos: list[Repository] = []
+        for provider in self.provider_tokens:
+            try:
+                service = self._get_service(provider)
+                service_repos = await service.get_repositories(sort, app_mode)
+                all_repos.extend(service_repos)
+            except Exception as e:
+                logger.warning(f'Error fetching repos from {provider}: {e}')
+
+        return all_repos
+
+    async def get_suggested_tasks(self) -> list[SuggestedTask]:
+        """
+        Get suggested tasks from providers
+        """
+        tasks: list[SuggestedTask] = []
+        for provider in self.provider_tokens:
+            try:
+                service = self._get_service(provider)
+                service_repos = await service.get_suggested_tasks()
+                tasks.extend(service_repos)
+            except Exception as e:
+                logger.warning(f'Error fetching repos from {provider}: {e}')
+
+        return tasks
+
+    async def search_repositories(
         self,
         query: str,
-        search_depth: str = "basic",
-        include_images: bool = False,
-        include_answer: bool = True,
-        max_results: int = 5
-    ) -> dict[str, Any]:
-        """
-        Search the web using Taviily
-        
-        Args:
-            query: Search query
-            search_depth: "basic" or "advanced" 
-            include_images: Whether to include images
-            include_answer: Whether to include AI-generated answer
-            max_results: Maximum number of results
-            
-        Returns:
-            Search results with URLs, content, and answer
-        """
-        if not self.is_configured():
-            raise ValueError("Taviily API key not configured")
-        
-        try:
-            # Import here to avoid dependency issues if not installed
-            from tavily import TavilyClient
-            
-            if self._client is None:
-                self._client = TavilyClient(api_key=self.api_key.get_secret_value())
-            
-            response = await self._client.search(
-                query=query,
-                search_depth=search_depth,
-                include_images=include_images,
-                include_answer=include_answer,
-                max_results=max_results
-            )
-            
-            return response
-            
-        except ImportError:
-            logger.error("Taviily client not installed. Install with: pip install tavily-python")
-            raise ValueError("Taviily client not available")
-        except Exception as e:
-            logger.error(f"Taviily search failed: {e}")
-            raise
-
-    async def extract_content(self, urls: list[str]) -> dict[str, str]:
-        """
-        Extract content from URLs using Taviily
-        
-        Args:
-            urls: List of URLs to extract content from
-            
-        Returns:
-            Dictionary mapping URLs to extracted content
-        """
-        if not self.is_configured():
-            raise ValueError("Taviily API key not configured")
-        
-        try:
-            from tavily import TavilyClient
-            
-            if self._client is None:
-                self._client = TavilyClient(api_key=self.api_key.get_secret_value())
-            
-            results = {}
-            for url in urls:
-                try:
-                    content = await self._client.extract(url)
-                    results[url] = content
-                except Exception as e:
-                    logger.warning(f"Failed to extract content from {url}: {e}")
-                    results[url] = f"Error: {str(e)}"
-            
-            return results
-            
-        except ImportError:
-            logger.error("Taviily client not installed. Install with: pip install tavily-python")
-            raise ValueError("Taviily client not available")
-        except Exception as e:
-            logger.error(f"Taviily content extraction failed: {e}")
-            raise
-
-
-# OpenRouter integration for accessing hundreds of models
-class OpenRouterIntegration:
-    """Integration with OpenRouter for accessing multiple LLM providers"""
-    
-    def __init__(self, api_key: SecretStr | None = None):
-        self.api_key = api_key
-        self.base_url = "https://openrouter.ai/api/v1"
-    
-    def is_configured(self) -> bool:
-        """Check if OpenRouter is properly configured"""
-        return self.api_key is not None
-    
-    async def get_available_models(self) -> list[dict[str, Any]]:
-        """
-        Get list of available models from OpenRouter
-        
-        Returns:
-            List of model information dictionaries
-        """
-        if not self.is_configured():
-            return []
-        
-        try:
-            import httpx
-            
-            headers = {
-                "Authorization": f"Bearer {self.api_key.get_secret_value()}",
-                "Content-Type": "application/json"
-            }
-            
-            async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    f"{self.base_url}/models",
-                    headers=headers
+        per_page: int,
+        sort: str,
+        order: str,
+    ) -> list[Repository]:
+        all_repos: list[Repository] = []
+        for provider in self.provider_tokens:
+            try:
+                service = self._get_service(provider)
+                service_repos = await service.search_repositories(
+                    query, per_page, sort, order
                 )
-                response.raise_for_status()
-                
-                models_data = response.json()
-                return models_data.get("data", [])
-                
-        except Exception as e:
-            logger.error(f"Failed to fetch OpenRouter models: {e}")
+                all_repos.extend(service_repos)
+            except Exception as e:
+                logger.warning(f'Error searching repos from {provider}: {e}')
+                continue
+
+        return all_repos
+
+    async def set_event_stream_secrets(
+        self,
+        event_stream: EventStream,
+        env_vars: dict[ProviderType, SecretStr] | None = None,
+    ) -> None:
+        """
+        This ensures that the latest provider tokens are masked from the event stream
+        It is called when the provider tokens are first initialized in the runtime or when tokens are re-exported with the latest working ones
+
+        Args:
+            event_stream: Agent session's event stream
+            env_vars: Dict of providers and their tokens that require updating
+        """
+        if env_vars:
+            exposed_env_vars = self.expose_env_vars(env_vars)
+        else:
+            exposed_env_vars = await self.get_env_vars(expose_secrets=True)
+        event_stream.set_secrets(exposed_env_vars)
+
+    def expose_env_vars(
+        self, env_secrets: dict[ProviderType, SecretStr]
+    ) -> dict[str, str]:
+        """
+        Return string values instead of typed values for environment secrets
+        Called just before exporting secrets to runtime, or setting secrets in the event stream
+        """
+        exposed_envs = {}
+        for provider, token in env_secrets.items():
+            env_key = ProviderHandler.get_provider_env_key(provider)
+            exposed_envs[env_key] = token.get_secret_value()
+
+        return exposed_envs
+
+    @overload
+    def get_env_vars(
+        self,
+        expose_secrets: Literal[True],
+        providers: list[ProviderType] | None = ...,
+        get_latest: bool = False,
+    ) -> Coroutine[Any, Any, dict[str, str]]: ...
+
+    @overload
+    def get_env_vars(
+        self,
+        expose_secrets: Literal[False],
+        providers: list[ProviderType] | None = ...,
+        get_latest: bool = False,
+    ) -> Coroutine[Any, Any, dict[ProviderType, SecretStr]]: ...
+
+    async def get_env_vars(
+        self,
+        expose_secrets: bool = False,
+        providers: list[ProviderType] | None = None,
+        get_latest: bool = False,
+    ) -> dict[ProviderType, SecretStr] | dict[str, str]:
+        """
+        Retrieves the provider tokens from ProviderHandler object
+        This is used when initializing/exporting new provider tokens in the runtime
+
+        Args:
+            expose_secrets: Flag which returns strings instead of secrets
+            providers: Return provider tokens for the list passed in, otherwise return all available providers
+            get_latest: Get the latest working token for the providers if True, otherwise get the existing ones
+        """
+
+        if not self.provider_tokens:
+            return {}
+
+        env_vars: dict[ProviderType, SecretStr] = {}
+        all_providers = [provider for provider in ProviderType]
+        provider_list = providers if providers else all_providers
+
+        for provider in provider_list:
+            if provider in self.provider_tokens:
+                token = (
+                    self.provider_tokens[provider].token
+                    if self.provider_tokens
+                    else SecretStr('')
+                )
+
+                if get_latest:
+                    token = await self._get_latest_provider_token(provider)
+
+                if token:
+                    env_vars[provider] = token
+
+        if not expose_secrets:
+            return env_vars
+
+        return self.expose_env_vars(env_vars)
+
+    @classmethod
+    def check_cmd_action_for_provider_token_ref(
+        cls, event: Action
+    ) -> list[ProviderType]:
+        """
+        Detect if agent run action is using a provider token (e.g $GITHUB_TOKEN)
+        Returns a list of providers which are called by the agent
+        """
+
+        if not isinstance(event, CmdRunAction):
             return []
-    
-    def get_model_config(self, model_id: str) -> dict[str, Any]:
+
+        called_providers = []
+        for provider in ProviderType:
+            if ProviderHandler.get_provider_env_key(provider) in event.command.lower():
+                called_providers.append(provider)
+
+        return called_providers
+
+    @classmethod
+    def get_provider_env_key(cls, provider: ProviderType) -> str:
         """
-        Get OpenRouter configuration for a specific model
-        
+        Map ProviderType value to the environment variable name in the runtime
+        """
+        return f'{provider.value}_token'.lower()
+
+    async def verify_repo_provider(
+        self, repository: str, specified_provider: ProviderType | None = None
+    ):
+        if specified_provider:
+            try:
+                service = self._get_service(specified_provider)
+                return await service.get_repository_details_from_repo_name(repository)
+            except Exception:
+                pass
+
+        for provider in self.provider_tokens:
+            try:
+                service = self._get_service(provider)
+                return await service.get_repository_details_from_repo_name(repository)
+            except Exception:
+                pass
+
+        raise AuthenticationError(f'Unable to access repo {repository}')
+
+    async def get_branches(
+        self, repository: str, specified_provider: ProviderType | None = None
+    ) -> list[Branch]:
+        """
+        Get branches for a repository
+
         Args:
-            model_id: The OpenRouter model ID
-            
+            repository: The repository name
+            specified_provider: Optional provider type to use
+
         Returns:
-            Configuration dictionary for LLMConfig
+            A list of branches for the repository
         """
-        return {
-            "model": model_id,
-            "base_url": self.base_url,
-            "api_key": self.api_key,
-            "openrouter_site_url": "https://github.com/ct1tz-bdgz/OpenReplica",
-            "openrouter_app_name": "OpenReplica"
-        }
-    
-    async def get_model_info(self, model_id: str) -> dict[str, Any] | None:
-        """
-        Get detailed information about a specific model
-        
-        Args:
-            model_id: The OpenRouter model ID
-            
-        Returns:
-            Model information or None if not found
-        """
-        models = await self.get_available_models()
-        for model in models:
-            if model.get("id") == model_id:
-                return model
-        return None
+        all_branches: list[Branch] = []
 
+        if specified_provider:
+            try:
+                service = self._get_service(specified_provider)
+                branches = await service.get_branches(repository)
+                return branches
+            except Exception as e:
+                logger.warning(
+                    f'Error fetching branches from {specified_provider}: {e}'
+                )
 
-# Provider model registry
-PROVIDER_MODEL_REGISTRY = {
-    "openai": {
-        "models": [
-            "gpt-4o",
-            "gpt-4o-mini", 
-            "gpt-4-turbo",
-            "gpt-4",
-            "gpt-3.5-turbo",
-            "o1-preview",
-            "o1-mini",
-            "o1-2024-12-17",
-            "o3-mini-2025-01-31",
-            "o3-mini",
-            "o3-2025-04-16",
-            "o4-mini-2025-04-16"
-        ],
-        "base_url": "https://api.openai.com/v1",
-        "supports_vision": True,
-        "supports_function_calling": True
-    },
-    "anthropic": {
-        "models": [
-            "claude-3-5-sonnet-20241022",
-            "claude-3-5-sonnet-20240620", 
-            "claude-3-5-haiku-20241022",
-            "claude-3-opus-20240229",
-            "claude-3-sonnet-20240229",
-            "claude-3-haiku-20240307",
-            "claude-2.1",
-            "claude-2.0",
-            "claude-instant-1.2"
-        ],
-        "base_url": "https://api.anthropic.com",
-        "supports_vision": True,
-        "supports_function_calling": True
-    },
-    "google": {
-        "models": [
-            "gemini-pro",
-            "gemini-pro-vision",
-            "gemini-1.5-pro",
-            "gemini-1.5-flash",
-            "palm-2-chat-bison",
-            "palm-2-codechat-bison"
-        ],
-        "base_url": "https://generativelanguage.googleapis.com/v1",
-        "supports_vision": True,
-        "supports_function_calling": True
-    },
-    "cohere": {
-        "models": [
-            "command-r-plus",
-            "command-r",
-            "command-nightly",
-            "command-light-nightly"
-        ],
-        "base_url": "https://api.cohere.ai/v1",
-        "supports_vision": False,
-        "supports_function_calling": True
-    },
-    "openrouter": {
-        "models": [],  # Populated dynamically
-        "base_url": "https://openrouter.ai/api/v1",
-        "supports_vision": True,  # Depends on specific model
-        "supports_function_calling": True  # Depends on specific model
-    },
-    "ollama": {
-        "models": [
-            "llama3.2",
-            "llama3.1",
-            "codellama",
-            "mistral",
-            "mixtral",
-            "qwen2.5",
-            "deepseek-coder",
-            "phi3"
-        ],
-        "base_url": "http://localhost:11434",
-        "supports_vision": False,
-        "supports_function_calling": False
-    },
-    "together": {
-        "models": [
-            "meta-llama/Llama-3.1-405B-Instruct-Turbo",
-            "meta-llama/Llama-3.1-70B-Instruct-Turbo",
-            "mistralai/Mixtral-8x7B-Instruct-v0.1",
-            "Qwen/Qwen2.5-72B-Instruct-Turbo"
-        ],
-        "base_url": "https://api.together.xyz/v1",
-        "supports_vision": False,
-        "supports_function_calling": True
-    },
-    "replicate": {
-        "models": [
-            "meta/llama-2-70b-chat",
-            "mistralai/mistral-7b-instruct-v0.1",
-            "google-deepmind/gemma-7b-it"
-        ],
-        "base_url": "https://api.replicate.com/v1",
-        "supports_vision": False,
-        "supports_function_calling": False
-    }
-}
+        for provider in self.provider_tokens:
+            try:
+                service = self._get_service(provider)
+                branches = await service.get_branches(repository)
+                all_branches.extend(branches)
+                # If we found branches, no need to check other providers
+                if all_branches:
+                    break
+            except Exception as e:
+                logger.warning(f'Error fetching branches from {provider}: {e}')
 
+        # Sort branches by last push date (newest first)
+        all_branches.sort(
+            key=lambda b: b.last_push_date if b.last_push_date else '', reverse=True
+        )
 
-def get_provider_models(provider: str) -> list[str]:
-    """Get available models for a provider"""
-    return PROVIDER_MODEL_REGISTRY.get(provider, {}).get("models", [])
+        # Move main/master branch to the top if it exists
+        main_branches = []
+        other_branches = []
 
+        for branch in all_branches:
+            if branch.name.lower() in ['main', 'master']:
+                main_branches.append(branch)
+            else:
+                other_branches.append(branch)
 
-def get_provider_info(provider: str) -> dict[str, Any]:
-    """Get provider information"""
-    return PROVIDER_MODEL_REGISTRY.get(provider, {})
-
-
-def get_all_providers() -> list[str]:
-    """Get list of all supported providers"""
-    return list(PROVIDER_MODEL_REGISTRY.keys())
-
-
-def is_model_supported(provider: str, model: str) -> bool:
-    """Check if a model is supported by a provider"""
-    models = get_provider_models(provider)
-    return model in models or provider == "openrouter"  # OpenRouter supports many models
+        return main_branches + other_branches

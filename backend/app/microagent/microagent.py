@@ -1,6 +1,3 @@
-"""
-Microagent implementation for OpenReplica matching OpenHands exactly
-"""
 import io
 from pathlib import Path
 from typing import Union
@@ -8,11 +5,11 @@ from typing import Union
 import frontmatter
 from pydantic import BaseModel
 
-from app.core.exceptions import MicroagentValidationError
-from app.core.logging import get_logger
+from app.core.exceptions import (
+    MicroagentValidationError,
+)
+from app.core.logger import openreplica_logger as logger
 from app.microagent.types import MicroagentMetadata, MicroagentType
-
-logger = get_logger(__name__)
 
 
 class BaseMicroagent(BaseModel):

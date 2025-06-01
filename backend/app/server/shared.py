@@ -1,108 +1,72 @@
-"""
-Shared components for OpenReplica server matching OpenHands exactly
-"""
-from typing import Any, Dict, Optional
-from app.core.config import get_settings
-from app.core.logging import get_logger
+import os
 
-logger = get_logger(__name__)
+import socketio
+from dotenv import load_dotenv
 
-# Global configuration
-config = get_settings()
+from app.core.config import load_openreplica_config
+from app.core.config.openreplica_config import OpenReplicaConfig
+from app.server.config.server_config import ServerConfig, load_server_config
+from app.server.conversation_manager.conversation_manager import (
+    ConversationManager,
+)
+from app.server.monitoring import MonitoringListener
+from app.server.types import ServerConfigInterface
+from app.storage import get_file_store
+from app.storage.conversation.conversation_store import ConversationStore
+from app.storage.files import FileStore
+from app.storage.secrets.secrets_store import SecretsStore
+from app.storage.settings.settings_store import SettingsStore
+from app.utils.import_utils import get_impl
 
+load_dotenv()
 
-class ConversationManager:
-    """Manager for conversation state and events"""
-    
-    def __init__(self):
-        self.conversations: Dict[str, Any] = {}
-        self.event_callbacks = []
-        self.status_callbacks = []
-    
-    def register_event_callback(self, callback):
-        """Register callback for new events"""
-        self.event_callbacks.append(callback)
-    
-    def register_status_callback(self, callback):
-        """Register callback for status changes"""
-        self.status_callbacks.append(callback)
-    
-    async def send_to_event_stream(self, conversation_id: str, event: Dict[str, Any]):
-        """Send event to event stream"""
-        # Notify all registered callbacks
-        for callback in self.event_callbacks:
-            try:
-                await callback(conversation_id, event)
-            except Exception as e:
-                logger.error(f"Error in event callback: {e}")
-    
-    async def update_status(self, conversation_id: str, status: str, data: Dict[str, Any] = None):
-        """Update conversation status"""
-        # Notify all registered callbacks
-        for callback in self.status_callbacks:
-            try:
-                await callback(conversation_id, status, data or {})
-            except Exception as e:
-                logger.error(f"Error in status callback: {e}")
-    
-    async def __aenter__(self):
-        """Async context manager entry"""
-        logger.info("Conversation manager starting...")
-        return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit"""
-        logger.info("Conversation manager shutting down...")
+config: OpenReplicaConfig = load_openreplica_config()
+server_config_interface: ServerConfigInterface = load_server_config()
+assert isinstance(server_config_interface, ServerConfig), (
+    'Loaded server config interface is not a ServerConfig, despite this being assumed'
+)
+server_config: ServerConfig = server_config_interface
+file_store: FileStore = get_file_store(
+    config.file_store,
+    config.file_store_path,
+    config.file_store_web_hook_url,
+    config.file_store_web_hook_headers,
+)
+
+client_manager = None
+redis_host = os.environ.get('REDIS_HOST')
+if redis_host:
+    client_manager = socketio.AsyncRedisManager(
+        f'redis://{redis_host}',
+        redis_options={'password': os.environ.get('REDIS_PASSWORD')},
+    )
 
 
-class ConversationStoreImpl:
-    """Implementation of conversation store"""
-    
-    @classmethod
-    async def get_instance(cls, config: Any, user_id: str):
-        """Get conversation store instance for user"""
-        # This would return the actual conversation store implementation
-        # For now, return a mock implementation
-        return MockConversationStore(user_id)
+sio = socketio.AsyncServer(
+    async_mode='asgi', cors_allowed_origins='*', client_manager=client_manager
+)
 
+MonitoringListenerImpl = get_impl(
+    MonitoringListener,
+    server_config.monitoring_listener_class,
+)
 
-class MockConversationStore:
-    """Mock conversation store for development"""
-    
-    def __init__(self, user_id: str):
-        self.user_id = user_id
-        self.conversations = {}
-    
-    async def list_conversations(self):
-        """List conversations for user"""
-        return []
-    
-    async def get_metadata(self, conversation_id: str):
-        """Get conversation metadata"""
-        return None
-    
-    async def create_conversation(self, **kwargs):
-        """Create new conversation"""
-        import uuid
-        conversation_id = str(uuid.uuid4())
-        return conversation_id
-    
-    async def update_metadata(self, conversation_id: str, **kwargs):
-        """Update conversation metadata"""
-        pass
-    
-    async def delete_conversation(self, conversation_id: str):
-        """Delete conversation"""
-        pass
-    
-    async def get_events(self, conversation_id: str, **kwargs):
-        """Get conversation events"""
-        return []
-    
-    async def add_event(self, conversation_id: str, event: Any):
-        """Add event to conversation"""
-        pass
+monitoring_listener = MonitoringListenerImpl.get_instance(config)
 
+ConversationManagerImpl = get_impl(
+    ConversationManager,
+    server_config.conversation_manager_class,
+)
 
-# Global conversation manager instance
-conversation_manager = ConversationManager()
+conversation_manager = ConversationManagerImpl.get_instance(
+    sio, config, file_store, server_config, monitoring_listener
+)
+
+SettingsStoreImpl = get_impl(SettingsStore, server_config.settings_store_class)
+
+SecretsStoreImpl = get_impl(SecretsStore, server_config.secret_store_class)
+
+ConversationStoreImpl = get_impl(
+    ConversationStore,
+    server_config.conversation_store_class,
+)

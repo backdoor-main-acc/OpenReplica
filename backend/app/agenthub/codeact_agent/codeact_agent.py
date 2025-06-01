@@ -1,6 +1,3 @@
-"""
-CodeAct Agent for OpenReplica matching OpenHands exactly
-"""
 import os
 import sys
 from collections import deque
@@ -25,7 +22,7 @@ from app.agenthub.codeact_agent.tools.think import ThinkTool
 from app.controller.agent import Agent
 from app.controller.state.state import State
 from app.core.config import AgentConfig
-from app.core.logging import get_logger
+from app.core.logger import openreplica_logger as logger
 from app.core.message import Message
 from app.events.action import AgentFinishAction, MessageAction
 from app.events.event import Event
@@ -40,8 +37,6 @@ from app.runtime.plugins import (
     PluginRequirement,
 )
 from app.utils.prompt import PromptManager
-
-logger = get_logger(__name__)
 
 
 class CodeActAgent(Agent):
@@ -61,7 +56,7 @@ class CodeActAgent(Agent):
     - Execute any valid Linux `bash` command
     - Execute any valid `Python` code with [an interactive Python interpreter](https://ipython.org/). This is simulated through `bash` command, see plugin system below for more details.
 
-    ![image](https://github.com/All-Hands-AI/OpenHands/assets/38853559/92b622e3-72ad-4a61-8f41-8c040b6d5fb3)
+    ![image](https://github.com/All-Hands-AI/OpenReplica/assets/38853559/92b622e3-72ad-4a61-8f41-8c040b6d5fb3)
 
     """
 
@@ -105,194 +100,172 @@ class CodeActAgent(Agent):
         return self._prompt_manager
 
     def _get_tools(self) -> list['ChatCompletionToolParam']:
-        """Get the list of tools available to the agent"""
+        # For these models, we use short tool descriptions ( < 1024 tokens)
+        # to avoid hitting the OpenAI token limit for tool descriptions.
+        SHORT_TOOL_DESCRIPTION_LLM_SUBSTRS = ['gpt-', 'o3', 'o1', 'o4']
+
+        use_short_tool_desc = False
+        if self.llm is not None:
+            use_short_tool_desc = any(
+                model_substr in self.llm.config.model
+                for model_substr in SHORT_TOOL_DESCRIPTION_LLM_SUBSTRS
+            )
+
         tools = []
-        
-        # Add core tools
-        tools.append(ThinkTool().to_tool_param())
-        tools.append(create_cmd_run_tool())
-        tools.append(IPythonTool().to_tool_param())
-        tools.append(create_str_replace_editor_tool())
-        tools.append(LLMBasedFileEditTool().to_tool_param())
-        tools.append(BrowserTool().to_tool_param())
-        tools.append(FinishTool().to_tool_param())
-        
-        # Add MCP tools if available
-        if hasattr(self, 'mcp_tools') and self.mcp_tools:
-            tools.extend(self.mcp_tools.values())
-        
+        if self.config.enable_cmd:
+            tools.append(create_cmd_run_tool(use_short_description=use_short_tool_desc))
+        if self.config.enable_think:
+            tools.append(ThinkTool)
+        if self.config.enable_finish:
+            tools.append(FinishTool)
+        if self.config.enable_browsing:
+            if sys.platform == 'win32':
+                logger.warning('Windows runtime does not support browsing yet')
+            else:
+                tools.append(BrowserTool)
+        if self.config.enable_jupyter:
+            tools.append(IPythonTool)
+        if self.config.enable_llm_editor:
+            tools.append(LLMBasedFileEditTool)
+        elif self.config.enable_editor:
+            tools.append(
+                create_str_replace_editor_tool(
+                    use_short_description=use_short_tool_desc
+                )
+            )
         return tools
 
     def reset(self) -> None:
-        """Reset the agent state"""
+        """Resets the CodeAct Agent."""
         super().reset()
         self.pending_actions.clear()
 
     def step(self, state: State) -> 'Action':
-        """
-        Performs one step using the CodeAct agent.
+        """Performs one step using the CodeAct Agent.
+
         This includes gathering info on previous steps and prompting the model to make a command to execute.
+
+        Parameters:
+        - state (State): used to get updated info
+
+        Returns:
+        - CmdRunAction(command) - bash command to run
+        - IPythonRunCellAction(code) - IPython code to run
+        - AgentDelegateAction(agent, inputs) - delegate action for (sub)task
+        - MessageAction(content) - Message action to run (e.g. ask for clarification)
+        - AgentFinishAction() - end the interaction
         """
-        # Check if there are pending actions to execute
+        # Continue with pending actions if any
         if self.pending_actions:
             return self.pending_actions.popleft()
 
-        # Handle special cases
-        if state.agent_state.value == 'paused':
-            return MessageAction('I am paused. Please provide further instructions.')
+        # if we're done, go back
+        latest_user_message = state.get_last_user_message()
+        if latest_user_message and latest_user_message.content.strip() == '/exit':
+            return AgentFinishAction()
 
-        # Get conversation history and create messages
-        messages = self._get_messages(state)
-        
-        # Add system message if this is the first step
-        if state.iteration == 0:
-            system_message_action = self.get_system_message()
-            if system_message_action:
-                # The system message is already added to the event stream
-                pass
+        # Condense the events from the state. If we get a view we'll pass those
+        # to the conversation manager for processing, but if we get a condensation
+        # event we'll just return that instead of an action. The controller will
+        # immediately ask the agent to step again with the new view.
+        condensed_history: list[Event] = []
+        match self.condenser.condensed_history(state):
+            case View(events=events):
+                condensed_history = events
 
-        # Check tools compatibility
-        tools = check_tools(self.tools, self.llm.model_name)
-        
-        try:
-            # Get response from LLM
-            response = self._query_llm(messages, tools)
-            
-            # Process the response and convert to action
-            action = self._response_to_action(response, state)
-            
-            return action
-            
-        except Exception as e:
-            logger.error(f'Error in CodeActAgent.step: {e}')
-            return MessageAction(f'I encountered an error: {str(e)}')
+            case Condensation(action=condensation_action):
+                return condensation_action
 
-    def _get_messages(self, state: State) -> list[Message]:
-        """Get conversation messages from state"""
-        messages = []
-        
-        # Convert events to messages
-        for event in state.history:
-            if isinstance(event, MessageAction):
-                messages.append(Message(
-                    role=event.source.value,
-                    content=event.content
-                ))
-        
-        # Apply memory condensation if needed
-        if len(messages) > self.config.max_iterations:
-            messages = self._condense_messages(messages, state)
-        
+        logger.debug(
+            f'Processing {len(condensed_history)} events from a total of {len(state.history)} events'
+        )
+
+        initial_user_message = self._get_initial_user_message(state.history)
+        messages = self._get_messages(condensed_history, initial_user_message)
+        params: dict = {
+            'messages': self.llm.format_messages_for_llm(messages),
+        }
+        params['tools'] = check_tools(self.tools, self.llm.config)
+        params['extra_body'] = {'metadata': state.to_llm_metadata(agent_name=self.name)}
+        response = self.llm.completion(**params)
+        logger.debug(f'Response from LLM: {response}')
+        actions = self.response_to_actions(response)
+        logger.debug(f'Actions after response_to_actions: {actions}')
+        for action in actions:
+            self.pending_actions.append(action)
+        return self.pending_actions.popleft()
+
+    def _get_initial_user_message(self, history: list[Event]) -> MessageAction:
+        """Finds the initial user message action from the full history."""
+        initial_user_message: MessageAction | None = None
+        for event in history:
+            if isinstance(event, MessageAction) and event.source == 'user':
+                initial_user_message = event
+                break
+
+        if initial_user_message is None:
+            # This should not happen in a valid conversation
+            logger.error(
+                f'CRITICAL: Could not find the initial user MessageAction in the full {len(history)} events history.'
+            )
+            # Depending on desired robustness, could raise error or create a dummy action
+            # and log the error
+            raise ValueError(
+                'Initial user message not found in history. Please report this issue.'
+            )
+        return initial_user_message
+
+    def _get_messages(
+        self, events: list[Event], initial_user_message: MessageAction
+    ) -> list[Message]:
+        """Constructs the message history for the LLM conversation.
+
+        This method builds a structured conversation history by processing events from the state
+        and formatting them into messages that the LLM can understand. It handles both regular
+        message flow and function-calling scenarios.
+
+        The method performs the following steps:
+        1. Checks for SystemMessageAction in events, adds one if missing (legacy support)
+        2. Processes events (Actions and Observations) into messages, including SystemMessageAction
+        3. Handles tool calls and their responses in function-calling mode
+        4. Manages message role alternation (user/assistant/tool)
+        5. Applies caching for specific LLM providers (e.g., Anthropic)
+        6. Adds environment reminders for non-function-calling mode
+
+        Args:
+            events: The list of events to convert to messages
+
+        Returns:
+            list[Message]: A list of formatted messages ready for LLM consumption, including:
+                - System message with prompt (from SystemMessageAction)
+                - Action messages (from both user and assistant)
+                - Observation messages (including tool responses)
+                - Environment reminders (in non-function-calling mode)
+
+        Note:
+            - In function-calling mode, tool calls and their responses are carefully tracked
+              to maintain proper conversation flow
+            - Messages from the same role are combined to prevent consecutive same-role messages
+            - For Anthropic models, specific messages are cached according to their documentation
+        """
+        if not self.prompt_manager:
+            raise Exception('Prompt Manager not instantiated.')
+
+        # Use ConversationMemory to process events (including SystemMessageAction)
+        messages = self.conversation_memory.process_events(
+            condensed_history=events,
+            initial_user_action=initial_user_message,
+            max_message_chars=self.llm.config.max_message_chars,
+            vision_is_active=self.llm.vision_is_active(),
+        )
+
+        if self.llm.is_caching_prompt_active():
+            self.conversation_memory.apply_prompt_caching(messages)
+
         return messages
 
-    def _condense_messages(self, messages: list[Message], state: State) -> list[Message]:
-        """Apply memory condensation to reduce message count"""
-        try:
-            # Use the condenser to reduce message count
-            condensation = self.condenser.condense(
-                messages=messages,
-                max_tokens=self.llm.get_model_info().get('max_tokens', 4096) // 2
-            )
-            
-            return condensation.messages
-            
-        except Exception as e:
-            logger.warning(f'Error in message condensation: {e}')
-            # Fallback: keep only recent messages
-            return messages[-self.config.max_iterations:]
-
-    def _query_llm(self, messages: list[Message], tools: list) -> 'ModelResponse':
-        """Query the LLM with messages and tools"""
-        return self.llm.completion(
-            messages=messages,
-            tools=tools if tools else None,
-            temperature=0.1,
-            max_tokens=4096
+    def response_to_actions(self, response: 'ModelResponse') -> list['Action']:
+        return codeact_function_calling.response_to_actions(
+            response,
+            mcp_tool_names=list(self.mcp_tools.keys()),
         )
-
-    def _response_to_action(self, response: 'ModelResponse', state: State) -> 'Action':
-        """Convert LLM response to action"""
-        try:
-            return codeact_function_calling.response_to_actions(
-                response=response,
-                agent=self,
-                state=state
-            )[0]  # Get the first action
-            
-        except Exception as e:
-            logger.error(f'Error converting response to action: {e}')
-            # Fallback to message action
-            choice = response.choices[0] if response.choices else None
-            message = choice.message if choice else None
-            content = message.content if message else str(e)
-            
-            return MessageAction(content)
-
-    def search_memory(self, query: str) -> list[str]:
-        """Search agent's memory for relevant information"""
-        try:
-            return self.conversation_memory.search(query)
-        except Exception as e:
-            logger.warning(f'Error searching memory: {e}')
-            return []
-
-    def add_to_memory(self, content: str, metadata: dict = None) -> None:
-        """Add content to agent's memory"""
-        try:
-            self.conversation_memory.add(content, metadata or {})
-        except Exception as e:
-            logger.warning(f'Error adding to memory: {e}')
-
-    def get_action_and_observation_sets(self) -> tuple[set[type], set[type]]:
-        """Get the action and observation sets for this agent"""
-        from app.events.action import (
-            CmdRunAction,
-            IPythonRunCellAction,
-            FileEditAction,
-            FileReadAction,
-            FileWriteAction,
-            BrowseURLAction,
-            BrowseInteractiveAction,
-            MessageAction,
-            AgentFinishAction,
-            AgentThinkAction
-        )
-        from app.events.observation import (
-            CmdOutputObservation,
-            IPythonRunCellObservation,
-            FileReadObservation,
-            FileWriteObservation,
-            FileEditObservation,
-            BrowserObservation,
-            ErrorObservation,
-            NullObservation
-        )
-        
-        action_types = {
-            CmdRunAction,
-            IPythonRunCellAction,
-            FileEditAction,
-            FileReadAction,
-            FileWriteAction,
-            BrowseURLAction,
-            BrowseInteractiveAction,
-            MessageAction,
-            AgentFinishAction,
-            AgentThinkAction
-        }
-        
-        observation_types = {
-            CmdOutputObservation,
-            IPythonRunCellObservation,
-            FileReadObservation,
-            FileWriteObservation,
-            FileEditObservation,
-            BrowserObservation,
-            ErrorObservation,
-            NullObservation
-        }
-        
-        return action_types, observation_types
-
-    def __repr__(self) -> str:
-        return f"CodeActAgent(version={self.VERSION}, complete={self._complete})"
