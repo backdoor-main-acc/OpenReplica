@@ -7,7 +7,26 @@ import type {
   CreateSessionRequest,
   CreateAgentRequest,
   WriteFileRequest,
-} from '@/types'
+} from '../types'
+
+// Microagent types
+export interface MicroagentResponse {
+  name: string
+  content: string
+  metadata: Record<string, any>
+  source: string
+  type: 'knowledge' | 'repo'
+  is_custom: boolean
+  created_at?: string
+  updated_at?: string
+}
+
+export interface CreateMicroagentRequest {
+  name: string
+  content: string
+  metadata: Record<string, any>
+  type: 'knowledge' | 'repo'
+}
 
 // Create axios instance
 const api = axios.create({
@@ -170,10 +189,54 @@ export const wsAPI = {
   },
 }
 
+// Microagents API
+export const microagentsAPI = {
+  getAll: async (type?: 'knowledge' | 'repo'): Promise<MicroagentResponse[]> => {
+    const response = await api.get('/microagents/', {
+      params: type ? { microagent_type: type } : {}
+    })
+    return response.data
+  },
+
+  get: async (name: string): Promise<MicroagentResponse> => {
+    const response = await api.get(`/microagents/${name}`)
+    return response.data
+  },
+
+  create: async (data: CreateMicroagentRequest): Promise<MicroagentResponse> => {
+    const response = await api.post('/microagents/', data)
+    return response.data
+  },
+
+  update: async (name: string, data: Partial<CreateMicroagentRequest>): Promise<MicroagentResponse> => {
+    const response = await api.put(`/microagents/${name}`, data)
+    return response.data
+  },
+
+  delete: async (name: string): Promise<void> => {
+    await api.delete(`/microagents/${name}`)
+  },
+
+  toggle: async (name: string): Promise<MicroagentResponse> => {
+    const response = await api.post(`/microagents/${name}/toggle`)
+    return response.data
+  },
+
+  trigger: async (name: string, context?: Record<string, any>): Promise<any> => {
+    const response = await api.post(`/microagents/${name}/trigger`, { context })
+    return response.data
+  },
+}
+
 // Health check
 export const healthAPI = {
   check: async () => {
     const response = await api.get('/health')
+    return response.data
+  },
+  
+  openreplica: async () => {
+    const response = await api.get('/health/openreplica')
     return response.data
   },
 }
