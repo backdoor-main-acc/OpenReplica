@@ -1,138 +1,129 @@
-import { io, Socket } from 'socket.io-client'
-import type { WebSocketMessage, ConnectionStatus } from '@/types'
+import type { WebSocketMessage, ConnectionStatus } from '../types'
 
 class WebSocketService {
-  private socket: Socket | null = null
+  private socket: WebSocket | null = null
   private reconnectAttempts = 0
   private maxReconnectAttempts = 5
   private reconnectDelay = 1000
   private listeners: Map<string, Set<(data: any) => void>> = new Map()
   private connectionListeners: Set<(status: ConnectionStatus) => void> = new Set()
+  private reconnectTimeout: NodeJS.Timeout | null = null
 
   connect(sessionId: string): void {
-    if (this.socket?.connected) {
+    if (this.socket?.readyState === WebSocket.OPEN) {
       this.disconnect()
     }
 
-    const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/connect/${sessionId}`
+    const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/api/ws/connect/${sessionId}`
     
-    this.socket = io(wsUrl, {
-      transports: ['websocket'],
-      autoConnect: true,
-      reconnection: true,
-      reconnectionAttempts: this.maxReconnectAttempts,
-      reconnectionDelay: this.reconnectDelay,
-    })
-
-    this.setupEventHandlers(sessionId)
+    try {
+      this.socket = new WebSocket(wsUrl)
+      this.setupEventHandlers(sessionId)
+    } catch (error) {
+      console.error('Failed to create WebSocket connection:', error)
+      this.notifyConnectionListeners({
+        connected: false,
+        session_id: sessionId,
+        error: error instanceof Error ? error.message : 'Connection failed',
+      })
+    }
   }
 
   private setupEventHandlers(sessionId: string): void {
     if (!this.socket) return
 
-    this.socket.on('connect', () => {
+    this.socket.onopen = () => {
       console.log('WebSocket connected')
       this.reconnectAttempts = 0
       this.notifyConnectionListeners({
         connected: true,
         session_id: sessionId,
       })
-    })
 
-    this.socket.on('disconnect', (reason) => {
-      console.log('WebSocket disconnected:', reason)
-      this.notifyConnectionListeners({
-        connected: false,
+      // Send initial connection message
+      this.send('connection', {
         session_id: sessionId,
-        error: reason,
-      })
-    })
-
-    this.socket.on('connect_error', (error) => {
-      console.error('WebSocket connection error:', error)
-      this.notifyConnectionListeners({
-        connected: false,
-        session_id: sessionId,
-        error: error.message,
-      })
-    })
-
-    this.socket.on('reconnect', (attemptNumber) => {
-      console.log('WebSocket reconnected after', attemptNumber, 'attempts')
-      this.notifyConnectionListeners({
-        connected: true,
-        session_id: sessionId,
-      })
-    })
-
-    this.socket.on('reconnect_error', (error) => {
-      console.error('WebSocket reconnection error:', error)
-      this.reconnectAttempts++
-    })
-
-    // Handle all message types
-    this.socket.onAny((eventName: string, data: any) => {
-      if (eventName.startsWith('socket.io')) return // Skip internal events
-      
-      const message: WebSocketMessage = {
-        type: eventName,
-        data,
         timestamp: new Date().toISOString(),
-        session_id: sessionId,
-      }
+      })
+    }
 
-      this.notifyListeners(eventName, message)
-    })
+    this.socket.onclose = (event) => {
+      console.log('WebSocket disconnected:', event.code, event.reason)
+      this.notifyConnectionListeners({
+        connected: false,
+        session_id: sessionId,
+        error: event.reason || 'Connection closed',
+      })
+
+      // Attempt to reconnect
+      if (this.reconnectAttempts < this.maxReconnectAttempts) {
+        this.reconnectAttempts++
+        const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1)
+        console.log(`Attempting to reconnect in ${delay}ms... (${this.reconnectAttempts}/${this.maxReconnectAttempts})`)
+        
+        this.reconnectTimeout = setTimeout(() => {
+          this.connect(sessionId)
+        }, delay)
+      }
+    }
+
+    this.socket.onerror = (error) => {
+      console.error('WebSocket error:', error)
+      this.notifyConnectionListeners({
+        connected: false,
+        session_id: sessionId,
+        error: 'WebSocket error occurred',
+      })
+    }
+
+    this.socket.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data)
+        const message: WebSocketMessage = {
+          type: data.type || 'message',
+          data: data.data || data,
+          timestamp: data.timestamp || new Date().toISOString(),
+          session_id: sessionId,
+        }
+
+        this.notifyListeners(message.type, message)
+      } catch (error) {
+        console.error('Error parsing WebSocket message:', error)
+      }
+    }
   }
 
   disconnect(): void {
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout)
+      this.reconnectTimeout = null
+    }
+
     if (this.socket) {
-      this.socket.disconnect()
+      this.socket.close(1000, 'Client disconnecting')
       this.socket = null
     }
   }
 
   send(type: string, data: any): void {
-    if (this.socket?.connected) {
-      this.socket.emit(type, {
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      const message = {
         type,
         data,
         timestamp: new Date().toISOString(),
-      })
+      }
+      this.socket.send(JSON.stringify(message))
     } else {
-      console.warn('WebSocket not connected, cannot send message:', type)
+      console.warn('WebSocket is not connected. Message not sent:', { type, data })
     }
   }
 
-  // Convenience methods for common message types
-  sendUserMessage(content: string): void {
-    this.send('user_message', { content })
-  }
-
-  startAgent(agentType: string): void {
-    this.send('start_agent', { agent_type: agentType })
-  }
-
-  stopAgent(): void {
-    this.send('stop_agent', {})
-  }
-
-  sendFileOperation(operation: string, data: any): void {
-    this.send('file_operation', { operation, ...data })
-  }
-
-  ping(): void {
-    this.send('ping', { timestamp: Date.now() })
-  }
-
-  // Event listening
   on(eventType: string, callback: (data: any) => void): () => void {
     if (!this.listeners.has(eventType)) {
       this.listeners.set(eventType, new Set())
     }
-    
     this.listeners.get(eventType)!.add(callback)
-    
+
     // Return unsubscribe function
     return () => {
       const listeners = this.listeners.get(eventType)
@@ -145,9 +136,10 @@ class WebSocketService {
     }
   }
 
-  onConnection(callback: (status: ConnectionStatus) => void): () => void {
+  onConnectionChange(callback: (status: ConnectionStatus) => void): () => void {
     this.connectionListeners.add(callback)
     
+    // Return unsubscribe function
     return () => {
       this.connectionListeners.delete(callback)
     }
@@ -160,19 +152,7 @@ class WebSocketService {
         try {
           callback(message)
         } catch (error) {
-          console.error('Error in WebSocket listener:', error)
-        }
-      })
-    }
-
-    // Also notify wildcard listeners
-    const wildcardListeners = this.listeners.get('*')
-    if (wildcardListeners) {
-      wildcardListeners.forEach(callback => {
-        try {
-          callback(message)
-        } catch (error) {
-          console.error('Error in wildcard WebSocket listener:', error)
+          console.error('Error in WebSocket event listener:', error)
         }
       })
     }
@@ -183,62 +163,85 @@ class WebSocketService {
       try {
         callback(status)
       } catch (error) {
-        console.error('Error in connection listener:', error)
+        console.error('Error in connection status listener:', error)
       }
     })
   }
 
   get isConnected(): boolean {
-    return this.socket?.connected ?? false
+    return this.socket?.readyState === WebSocket.OPEN
   }
 
-  get connectionState(): string {
-    if (!this.socket) return 'disconnected'
-    return this.socket.connected ? 'connected' : 'disconnected'
+  get connectionStatus(): ConnectionStatus {
+    return {
+      connected: this.isConnected,
+      session_id: '', // Will be set when connecting
+    }
   }
 }
 
-// Create singleton instance
-export const websocketService = new WebSocketService()
-
 // Hook for React components
-import { useEffect, useState } from 'react'
-import { useAppStore } from '@/stores/appStore'
+import { useState, useEffect, useCallback, useRef } from 'react'
 
-export const useWebSocket = (sessionId: string | null) => {
-  const { setConnected } = useAppStore()
+export function useWebSocket(sessionId: string | null) {
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>({
     connected: false,
+    session_id: sessionId || '',
   })
+  const wsRef = useRef<WebSocketService | null>(null)
 
   useEffect(() => {
     if (!sessionId) return
 
-    // Connect to WebSocket
-    websocketService.connect(sessionId)
-
-    // Listen for connection status changes
-    const unsubscribe = websocketService.onConnection((status) => {
-      setConnectionStatus(status)
-      setConnected(status.connected)
-    })
+    // Create WebSocket service instance
+    wsRef.current = new WebSocketService()
+    
+    // Set up connection status listener
+    const unsubscribe = wsRef.current.onConnectionChange(setConnectionStatus)
+    
+    // Connect
+    wsRef.current.connect(sessionId)
 
     return () => {
       unsubscribe()
-      websocketService.disconnect()
+      wsRef.current?.disconnect()
+      wsRef.current = null
     }
-  }, [sessionId, setConnected])
+  }, [sessionId])
+
+  const sendUserMessage = useCallback((message: string) => {
+    if (wsRef.current) {
+      wsRef.current.send('user_message', { content: message })
+    }
+  }, [])
+
+  const startAgent = useCallback((agentType: string) => {
+    if (wsRef.current) {
+      wsRef.current.send('start_agent', { agent_type: agentType })
+    }
+  }, [])
+
+  const stopAgent = useCallback(() => {
+    if (wsRef.current) {
+      wsRef.current.send('stop_agent', {})
+    }
+  }, [])
+
+  const on = useCallback((eventType: string, callback: (data: any) => void) => {
+    if (wsRef.current) {
+      return wsRef.current.on(eventType, callback)
+    }
+    return () => {} // Empty unsubscribe function
+  }, [])
 
   return {
     connectionStatus,
-    isConnected: websocketService.isConnected,
-    send: websocketService.send.bind(websocketService),
-    sendUserMessage: websocketService.sendUserMessage.bind(websocketService),
-    startAgent: websocketService.startAgent.bind(websocketService),
-    stopAgent: websocketService.stopAgent.bind(websocketService),
-    sendFileOperation: websocketService.sendFileOperation.bind(websocketService),
-    on: websocketService.on.bind(websocketService),
+    isConnected: connectionStatus.connected,
+    sendUserMessage,
+    startAgent,
+    stopAgent,
+    on,
   }
 }
 
-export default websocketService
+export default WebSocketService
