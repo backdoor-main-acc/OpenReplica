@@ -23,7 +23,7 @@ Microagents are specialized prompts that provide context and capabilities for sp
 
 When creating a new microagent:
 
-- Create a markdown file in `.openhands/microagents/` with an appropriate name (e.g., `github.md`, `google_workspace.md`)
+- Create a markdown file in `.openreplica/microagents/` with an appropriate name (e.g., `github.md`, `google_workspace.md`)
 - Include YAML frontmatter with metadata (name, type, version, agent, triggers)
 - type is by DEFAULT knowledge
 - version is DEFAULT 1.0.0
@@ -33,9 +33,3 @@ When creating a new microagent:
 - Include error handling guidance and limitations
 - Provide clear usage examples
 - Keep the prompt focused and concise
-
-For detailed information, see:
-
-- [Microagents Overview](https://docs.all-hands.dev/usage/prompting/microagents-overview)
-- [Microagents Syntax](https://docs.all-hands.dev/usage/prompting/microagents-syntax)
-- [Example GitHub Microagent](https://github.com/All-Hands-AI/OpenHands/blob/main/microagents/github.md)
