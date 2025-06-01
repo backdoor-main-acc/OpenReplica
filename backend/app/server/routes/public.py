@@ -1,79 +1,69 @@
-"""
-Public routes for OpenReplica matching OpenHands exactly
-"""
-from fastapi import APIRouter, HTTPException, status
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from typing import Dict, Any
+from typing import Any
 
-from app.core.logging import get_logger
-from app import __version__
+from fastapi import APIRouter
 
-logger = get_logger(__name__)
+from app.controller.agent import Agent
+from app.security.options import SecurityAnalyzers
+from app.server.dependencies import get_dependencies
+from app.server.shared import config, server_config
+from app.utils.llm import get_supported_llm_models
 
-app = APIRouter(prefix='/api/public')
+app = APIRouter(prefix='/api/options', dependencies=get_dependencies())
 
 
-class StatusResponse(BaseModel):
-    """Response model for status endpoint"""
-    status: str
-    version: str
-    message: str
+@app.get('/models', response_model=list[str])
+async def get_litellm_models() -> list[str]:
+    """Get all models supported by LiteLLM.
+
+    This function combines models from litellm and Bedrock, removing any
+    error-prone Bedrock models.
+
+    To get the models:
+    ```sh
+    curl http://localhost:3000/api/litellm-models
+    ```
+
+    Returns:
+        list[str]: A sorted list of unique model names.
+    """
+    return get_supported_llm_models(config)
 
 
-@app.get('/status', response_model=StatusResponse)
-async def get_status() -> StatusResponse:
-    """Get public status of the service"""
-    return StatusResponse(
-        status="healthy",
-        version=__version__,
-        message="OpenReplica is running"
-    )
+@app.get('/agents', response_model=list[str])
+async def get_agents() -> list[str]:
+    """Get all agents supported by LiteLLM.
+
+    To get the agents:
+    ```sh
+    curl http://localhost:3000/api/agents
+    ```
+
+    Returns:
+        list[str]: A sorted list of agent names.
+    """
+    return sorted(Agent.list_agents())
 
 
-@app.get('/version')
-async def get_version() -> JSONResponse:
-    """Get version information"""
-    return JSONResponse({
-        "version": __version__,
-        "name": "OpenReplica",
-        "description": "The Next Generation AI Development Platform"
-    })
+@app.get('/security-analyzers', response_model=list[str])
+async def get_security_analyzers() -> list[str]:
+    """Get all supported security analyzers.
+
+    To get the security analyzers:
+    ```sh
+    curl http://localhost:3000/api/security-analyzers
+    ```
+
+    Returns:
+        list[str]: A sorted list of security analyzer names.
+    """
+    return sorted(SecurityAnalyzers.keys())
 
 
-@app.get('/info')
-async def get_info() -> JSONResponse:
-    """Get public information about the service"""
-    return JSONResponse({
-        "name": "OpenReplica",
-        "version": __version__,
-        "description": "The Next Generation AI Development Platform",
-        "features": [
-            "AI-powered code generation",
-            "Multiple LLM provider support",
-            "Real-time collaboration",
-            "Custom microagents",
-            "Git integration",
-            "VS Code session viewing",
-            "File download and export"
-        ],
-        "supported_llm_providers": [
-            "OpenAI",
-            "Anthropic",
-            "Google",
-            "Cohere",
-            "OpenRouter",
-            "Ollama",
-            "Together",
-            "Replicate"
-        ]
-    })
+@app.get('/config', response_model=dict[str, Any])
+async def get_config() -> dict[str, Any]:
+    """Get current config.
 
-
-@app.get('/health')
-async def health_check() -> JSONResponse:
-    """Public health check endpoint"""
-    return JSONResponse({
-        "status": "healthy",
-        "timestamp": "2024-01-01T00:00:00Z"
-    })
+    Returns:
+        dict[str, Any]: The current server configuration.
+    """
+    return server_config.get_config()

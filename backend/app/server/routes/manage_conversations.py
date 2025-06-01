@@ -1,416 +1,302 @@
-"""
-Manage conversations routes for OpenReplica matching OpenHands exactly
-"""
-from typing import Any
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+import asyncio
+import uuid
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
-from app.core.logging import get_logger
+from app.core.logger import openreplica_logger as logger
+from app.integrations.provider import (
+    PROVIDER_TOKEN_TYPE,
+    ProviderHandler,
+)
+from app.integrations.service_types import (
+    AuthenticationError,
+    ProviderType,
+    SuggestedTask,
+)
+from app.runtime import get_runtime_cls
+from app.server.data_models.agent_loop_info import AgentLoopInfo
+from app.server.data_models.conversation_info import ConversationInfo
+from app.server.data_models.conversation_info_result_set import (
+    ConversationInfoResultSet,
+)
 from app.server.dependencies import get_dependencies
-from app.server.shared import ConversationStoreImpl, config
-from app.server.user_auth import get_user_id
+from app.server.services.conversation_service import create_new_conversation
+from app.server.shared import (
+    ConversationStoreImpl,
+    config,
+    conversation_manager,
+)
+from app.server.types import LLMAuthenticationError, MissingSettingsError
+from app.server.user_auth import (
+    get_auth_type,
+    get_provider_tokens,
+    get_user_id,
+    get_user_secrets,
+)
+from app.server.user_auth.user_auth import AuthType
+from app.server.utils import get_conversation_store
 from app.storage.conversation.conversation_store import ConversationStore
-
-logger = get_logger(__name__)
+from app.storage.data_models.conversation_metadata import (
+    ConversationMetadata,
+    ConversationTrigger,
+)
+from app.storage.data_models.conversation_status import ConversationStatus
+from app.storage.data_models.user_secrets import UserSecrets
+from app.utils.async_utils import wait_all
+from app.utils.conversation_summary import get_default_conversation_title
 
 app = APIRouter(prefix='/api', dependencies=get_dependencies())
 
 
-@app.get('/conversations')
-async def list_conversations(
-    user_id: str = Depends(get_user_id),
-) -> list[dict[str, Any]]:
-    """List all conversations for the user.
+class InitSessionRequest(BaseModel):
+    repository: str | None = None
+    git_provider: ProviderType | None = None
+    selected_branch: str | None = None
+    initial_user_msg: str | None = None
+    image_urls: list[str] | None = None
+    replay_json: str | None = None
+    suggested_task: SuggestedTask | None = None
+    conversation_instructions: str | None = None
+    conversation_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
 
-    Args:
-        user_id: The user ID.
+    model_config = {'extra': 'forbid'}
 
-    Returns:
-        List of conversation metadata.
-    """
-    try:
-        conversation_store = await ConversationStoreImpl.get_instance(config, user_id)
-        conversations = await conversation_store.list_conversations()
-        
-        # Convert to list of dictionaries
-        conversation_list = []
-        for conv in conversations:
-            conv_dict = {
-                'conversation_id': conv.conversation_id,
-                'title': conv.title or 'Untitled Conversation',
-                'created_at': conv.created_at.isoformat() if conv.created_at else None,
-                'updated_at': conv.updated_at.isoformat() if conv.updated_at else None,
-                'agent_class': conv.agent_class,
-                'llm_model': conv.llm_model,
-                'status': conv.status or 'active',
-                'last_message': conv.last_message,
-                'message_count': conv.message_count or 0,
-                'selected_repository': conv.selected_repository,
-            }
-            conversation_list.append(conv_dict)
-        
-        return conversation_list
-        
-    except Exception as e:
-        logger.error(f'Error listing conversations for user {user_id}: {e}')
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f'Error listing conversations: {e}'
-        )
+
+class InitSessionResponse(BaseModel):
+    status: str
+    conversation_id: str
+    message: str | None = None
 
 
 @app.post('/conversations')
-async def create_conversation(
-    request: Request,
+async def new_conversation(
+    data: InitSessionRequest,
     user_id: str = Depends(get_user_id),
-) -> JSONResponse:
-    """Create a new conversation.
+    provider_tokens: PROVIDER_TOKEN_TYPE = Depends(get_provider_tokens),
+    user_secrets: UserSecrets = Depends(get_user_secrets),
+    auth_type: AuthType | None = Depends(get_auth_type),
+) -> InitSessionResponse:
+    """Initialize a new session or join an existing one.
 
-    Args:
-        request: The request containing conversation data.
-        user_id: The user ID.
-
-    Returns:
-        JSONResponse with the new conversation ID.
+    After successful initialization, the client should connect to the WebSocket
+    using the returned conversation ID.
     """
-    try:
-        data = await request.json()
-        
-        conversation_store = await ConversationStoreImpl.get_instance(config, user_id)
-        
-        # Create new conversation
-        conversation_id = await conversation_store.create_conversation(
-            title=data.get('title', 'New Conversation'),
-            agent_class=data.get('agent_class', 'CodeActAgent'),
-            llm_model=data.get('llm_model', 'claude-3-5-sonnet-20241022'),
-            selected_repository=data.get('selected_repository'),
-            initial_message=data.get('initial_message'),
-        )
-        
+    logger.info(f'initializing_new_conversation:{data}')
+    repository = data.repository
+    selected_branch = data.selected_branch
+    initial_user_msg = data.initial_user_msg
+    image_urls = data.image_urls or []
+    replay_json = data.replay_json
+    suggested_task = data.suggested_task
+    git_provider = data.git_provider
+    conversation_instructions = data.conversation_instructions
+
+    conversation_trigger = ConversationTrigger.GUI
+
+    if suggested_task:
+        initial_user_msg = suggested_task.get_prompt_for_task()
+        conversation_trigger = ConversationTrigger.SUGGESTED_TASK
+
+    if auth_type == AuthType.BEARER:
+        conversation_trigger = ConversationTrigger.REMOTE_API_KEY
+
+    if (
+        conversation_trigger == ConversationTrigger.REMOTE_API_KEY
+        and not initial_user_msg
+    ):
         return JSONResponse(
-            status_code=status.HTTP_201_CREATED,
             content={
-                'conversation_id': conversation_id,
-                'message': 'Conversation created successfully'
-            }
+                'status': 'error',
+                'message': 'Missing initial user message',
+                'msg_id': 'CONFIGURATION$MISSING_USER_MESSAGE',
+            },
+            status_code=status.HTTP_400_BAD_REQUEST,
         )
-        
-    except Exception as e:
-        logger.error(f'Error creating conversation for user {user_id}: {e}')
+
+    try:
+        if repository:
+            provider_handler = ProviderHandler(provider_tokens)
+            # Check against git_provider, otherwise check all provider apis
+            await provider_handler.verify_repo_provider(repository, git_provider)
+
+        conversation_id = data.conversation_id
+        await create_new_conversation(
+            user_id=user_id,
+            git_provider_tokens=provider_tokens,
+            custom_secrets=user_secrets.custom_secrets if user_secrets else None,
+            selected_repository=repository,
+            selected_branch=selected_branch,
+            initial_user_msg=initial_user_msg,
+            image_urls=image_urls,
+            replay_json=replay_json,
+            conversation_trigger=conversation_trigger,
+            conversation_instructions=conversation_instructions,
+            git_provider=git_provider,
+            conversation_id=conversation_id,
+        )
+
+        return InitSessionResponse(
+            status='ok',
+            conversation_id=conversation_id,
+        )
+    except MissingSettingsError as e:
         return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={'error': f'Error creating conversation: {e}'}
+            content={
+                'status': 'error',
+                'message': str(e),
+                'msg_id': 'CONFIGURATION$SETTINGS_NOT_FOUND',
+            },
+            status_code=status.HTTP_400_BAD_REQUEST,
         )
+
+    except LLMAuthenticationError as e:
+        return JSONResponse(
+            content={
+                'status': 'error',
+                'message': str(e),
+                'msg_id': 'STATUS$ERROR_LLM_AUTHENTICATION',
+            },
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    except AuthenticationError as e:
+        return JSONResponse(
+            content={
+                'status': 'error',
+                'message': str(e),
+                'msg_id': 'STATUS$GIT_PROVIDER_AUTHENTICATION_ERROR',
+            },
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+@app.get('/conversations')
+async def search_conversations(
+    page_id: str | None = None,
+    limit: int = 20,
+    conversation_store: ConversationStore = Depends(get_conversation_store),
+) -> ConversationInfoResultSet:
+    conversation_metadata_result_set = await conversation_store.search(page_id, limit)
+
+    # Filter out conversations older than max_age
+    now = datetime.now(timezone.utc)
+    max_age = config.conversation_max_age_seconds
+    filtered_results = [
+        conversation
+        for conversation in conversation_metadata_result_set.results
+        if hasattr(conversation, 'created_at')
+        and (now - conversation.created_at.replace(tzinfo=timezone.utc)).total_seconds()
+        <= max_age
+    ]
+
+    conversation_ids = set(
+        conversation.conversation_id for conversation in filtered_results
+    )
+    connection_ids_to_conversation_ids = await conversation_manager.get_connections(
+        filter_to_sids=conversation_ids
+    )
+    agent_loop_info = await conversation_manager.get_agent_loop_info(
+        filter_to_sids=conversation_ids
+    )
+    agent_loop_info_by_conversation_id = {
+        info.conversation_id: info for info in agent_loop_info
+    }
+    result = ConversationInfoResultSet(
+        results=await wait_all(
+            _get_conversation_info(
+                conversation=conversation,
+                num_connections=sum(
+                    1
+                    for conversation_id in connection_ids_to_conversation_ids.values()
+                    if conversation_id == conversation.conversation_id
+                ),
+                agent_loop_info=agent_loop_info_by_conversation_id.get(
+                    conversation.conversation_id
+                ),
+            )
+            for conversation in filtered_results
+        ),
+        next_page_id=conversation_metadata_result_set.next_page_id,
+    )
+    return result
 
 
 @app.get('/conversations/{conversation_id}')
 async def get_conversation(
     conversation_id: str,
-    user_id: str = Depends(get_user_id),
-) -> dict[str, Any]:
-    """Get conversation metadata.
-
-    Args:
-        conversation_id: The conversation ID.
-        user_id: The user ID.
-
-    Returns:
-        Conversation metadata.
-    """
+    conversation_store: ConversationStore = Depends(get_conversation_store),
+) -> ConversationInfo | None:
     try:
-        conversation_store = await ConversationStoreImpl.get_instance(config, user_id)
         metadata = await conversation_store.get_metadata(conversation_id)
-        
-        if not metadata:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail='Conversation not found'
-            )
-        
-        return {
-            'conversation_id': metadata.conversation_id,
-            'title': metadata.title or 'Untitled Conversation',
-            'created_at': metadata.created_at.isoformat() if metadata.created_at else None,
-            'updated_at': metadata.updated_at.isoformat() if metadata.updated_at else None,
-            'agent_class': metadata.agent_class,
-            'llm_model': metadata.llm_model,
-            'status': metadata.status or 'active',
-            'last_message': metadata.last_message,
-            'message_count': metadata.message_count or 0,
-            'selected_repository': metadata.selected_repository,
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f'Error getting conversation {conversation_id} for user {user_id}: {e}')
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f'Error getting conversation: {e}'
+        num_connections = len(
+            await conversation_manager.get_connections(filter_to_sids={conversation_id})
         )
-
-
-@app.put('/conversations/{conversation_id}')
-async def update_conversation(
-    conversation_id: str,
-    request: Request,
-    user_id: str = Depends(get_user_id),
-) -> JSONResponse:
-    """Update conversation metadata.
-
-    Args:
-        conversation_id: The conversation ID.
-        request: The request containing updated data.
-        user_id: The user ID.
-
-    Returns:
-        JSONResponse with success status.
-    """
-    try:
-        data = await request.json()
-        
-        conversation_store = await ConversationStoreImpl.get_instance(config, user_id)
-        
-        # Update conversation metadata
-        await conversation_store.update_metadata(
-            conversation_id=conversation_id,
-            title=data.get('title'),
-            status=data.get('status'),
-            selected_repository=data.get('selected_repository'),
+        agent_loop_infos = await conversation_manager.get_agent_loop_info(
+            filter_to_sids={conversation_id}
         )
-        
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={'message': 'Conversation updated successfully'}
+        agent_loop_info = agent_loop_infos[0] if agent_loop_infos else None
+        conversation_info = await _get_conversation_info(
+            metadata, num_connections, agent_loop_info
         )
-        
-    except Exception as e:
-        logger.error(f'Error updating conversation {conversation_id} for user {user_id}: {e}')
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={'error': f'Error updating conversation: {e}'}
-        )
+        return conversation_info
+    except FileNotFoundError:
+        return None
 
 
 @app.delete('/conversations/{conversation_id}')
 async def delete_conversation(
     conversation_id: str,
-    user_id: str = Depends(get_user_id),
-) -> JSONResponse:
-    """Delete a conversation.
-
-    Args:
-        conversation_id: The conversation ID.
-        user_id: The user ID.
-
-    Returns:
-        JSONResponse with success status.
-    """
+    user_id: str | None = Depends(get_user_id),
+) -> bool:
+    conversation_store = await ConversationStoreImpl.get_instance(config, user_id)
     try:
-        conversation_store = await ConversationStoreImpl.get_instance(config, user_id)
-        
-        # Delete the conversation
-        await conversation_store.delete_conversation(conversation_id)
-        
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={'message': 'Conversation deleted successfully'}
-        )
-        
-    except Exception as e:
-        logger.error(f'Error deleting conversation {conversation_id} for user {user_id}: {e}')
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={'error': f'Error deleting conversation: {e}'}
-        )
+        await conversation_store.get_metadata(conversation_id)
+    except FileNotFoundError:
+        return False
+    is_running = await conversation_manager.is_agent_loop_running(conversation_id)
+    if is_running:
+        await conversation_manager.close_session(conversation_id)
+    runtime_cls = get_runtime_cls(config.runtime)
+    await runtime_cls.delete(conversation_id)
+    await conversation_store.delete_metadata(conversation_id)
+    return True
 
 
-@app.post('/conversations/{conversation_id}/clone')
-async def clone_conversation(
-    conversation_id: str,
-    request: Request,
-    user_id: str = Depends(get_user_id),
-) -> JSONResponse:
-    """Clone a conversation.
-
-    Args:
-        conversation_id: The conversation ID to clone.
-        request: The request containing clone options.
-        user_id: The user ID.
-
-    Returns:
-        JSONResponse with the new conversation ID.
-    """
+async def _get_conversation_info(
+    conversation: ConversationMetadata,
+    num_connections: int,
+    agent_loop_info: AgentLoopInfo | None,
+) -> ConversationInfo | None:
     try:
-        data = await request.json()
-        
-        conversation_store = await ConversationStoreImpl.get_instance(config, user_id)
-        
-        # Get original conversation
-        original_metadata = await conversation_store.get_metadata(conversation_id)
-        if not original_metadata:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail='Original conversation not found'
-            )
-        
-        # Create cloned conversation
-        new_conversation_id = await conversation_store.create_conversation(
-            title=data.get('title', f"Copy of {original_metadata.title}"),
-            agent_class=original_metadata.agent_class,
-            llm_model=original_metadata.llm_model,
-            selected_repository=original_metadata.selected_repository,
+        title = conversation.title
+        if not title:
+            title = get_default_conversation_title(conversation.conversation_id)
+        return ConversationInfo(
+            trigger=conversation.trigger,
+            conversation_id=conversation.conversation_id,
+            title=title,
+            last_updated_at=conversation.last_updated_at,
+            created_at=conversation.created_at,
+            selected_repository=conversation.selected_repository,
+            selected_branch=conversation.selected_branch,
+            git_provider=conversation.git_provider,
+            status=(
+                agent_loop_info.status
+                if agent_loop_info
+                else ConversationStatus.STOPPED
+            ),
+            num_connections=num_connections,
+            url=agent_loop_info.url if agent_loop_info else None,
+            session_api_key=agent_loop_info.session_api_key
+            if agent_loop_info
+            else None,
         )
-        
-        # Optionally copy events if requested
-        if data.get('copy_events', False):
-            events = await conversation_store.get_events(conversation_id)
-            for event in events:
-                await conversation_store.add_event(new_conversation_id, event)
-        
-        return JSONResponse(
-            status_code=status.HTTP_201_CREATED,
-            content={
-                'conversation_id': new_conversation_id,
-                'message': 'Conversation cloned successfully'
-            }
-        )
-        
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f'Error cloning conversation {conversation_id} for user {user_id}: {e}')
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={'error': f'Error cloning conversation: {e}'}
+        logger.error(
+            f'Error loading conversation {conversation.conversation_id}: {str(e)}',
+            extra={'session_id': conversation.conversation_id},
         )
-
-
-@app.get('/conversations/{conversation_id}/events')
-async def get_conversation_events(
-    conversation_id: str,
-    user_id: str = Depends(get_user_id),
-    start_id: int = 0,
-    limit: int = 100,
-    event_type: str | None = None,
-) -> JSONResponse:
-    """Get events for a conversation.
-
-    Args:
-        conversation_id: The conversation ID.
-        user_id: The user ID.
-        start_id: Starting event ID.
-        limit: Maximum number of events to return.
-        event_type: Filter by event type.
-
-    Returns:
-        JSONResponse with events list.
-    """
-    try:
-        conversation_store = await ConversationStoreImpl.get_instance(config, user_id)
-        
-        events = await conversation_store.get_events(
-            conversation_id=conversation_id,
-            start_id=start_id,
-            limit=limit,
-            event_type=event_type,
-        )
-        
-        # Convert events to dictionaries
-        events_list = []
-        for event in events:
-            event_dict = {
-                'id': event.id,
-                'timestamp': event.timestamp.isoformat() if event.timestamp else None,
-                'source': event.source,
-                'message': event.message,
-                'extras': event.extras,
-                'action': getattr(event, 'action', None),
-                'observation': getattr(event, 'observation', None),
-            }
-            events_list.append(event_dict)
-        
-        return JSONResponse({
-            'events': events_list,
-            'total_events': len(events_list),
-            'conversation_id': conversation_id,
-        })
-        
-    except Exception as e:
-        logger.error(f'Error getting events for conversation {conversation_id}: {e}')
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={'error': f'Error getting conversation events: {e}'}
-        )
-
-
-@app.post('/conversations/{conversation_id}/archive')
-async def archive_conversation(
-    conversation_id: str,
-    user_id: str = Depends(get_user_id),
-) -> JSONResponse:
-    """Archive a conversation.
-
-    Args:
-        conversation_id: The conversation ID.
-        user_id: The user ID.
-
-    Returns:
-        JSONResponse with success status.
-    """
-    try:
-        conversation_store = await ConversationStoreImpl.get_instance(config, user_id)
-        
-        # Update conversation status to archived
-        await conversation_store.update_metadata(
-            conversation_id=conversation_id,
-            status='archived'
-        )
-        
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={'message': 'Conversation archived successfully'}
-        )
-        
-    except Exception as e:
-        logger.error(f'Error archiving conversation {conversation_id} for user {user_id}: {e}')
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={'error': f'Error archiving conversation: {e}'}
-        )
-
-
-@app.post('/conversations/{conversation_id}/unarchive')
-async def unarchive_conversation(
-    conversation_id: str,
-    user_id: str = Depends(get_user_id),
-) -> JSONResponse:
-    """Unarchive a conversation.
-
-    Args:
-        conversation_id: The conversation ID.
-        user_id: The user ID.
-
-    Returns:
-        JSONResponse with success status.
-    """
-    try:
-        conversation_store = await ConversationStoreImpl.get_instance(config, user_id)
-        
-        # Update conversation status to active
-        await conversation_store.update_metadata(
-            conversation_id=conversation_id,
-            status='active'
-        )
-        
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={'message': 'Conversation unarchived successfully'}
-        )
-        
-    except Exception as e:
-        logger.error(f'Error unarchiving conversation {conversation_id} for user {user_id}: {e}')
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={'error': f'Error unarchiving conversation: {e}'}
-        )
+        return None

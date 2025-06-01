@@ -7,10 +7,9 @@ from pydantic import BaseModel
 
 from app.agents import create_agent, get_available_agents, AgentConfig
 from app.agents.base import AgentState
-from app.core.logging import get_logger
+from app.core.logger import openreplica_logger as logger
 
 router = APIRouter()
-logger = get_logger(__name__)
 
 # In-memory store for demo (use database in production)
 active_agents: Dict[str, Any] = {}

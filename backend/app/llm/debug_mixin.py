@@ -1,39 +1,53 @@
-"""
-Debug mixin for LLM interactions
-"""
-import json
 from typing import Any
 
-from app.core.logging import get_logger
+from app.core.logger import llm_prompt_logger, llm_response_logger
+from app.core.logger import openreplica_logger as logger
 
-logger = get_logger(__name__)
+MESSAGE_SEPARATOR = '\n\n----------\n\n'
 
 
 class DebugMixin:
-    """Mixin class for debugging LLM interactions"""
-    
-    def debug_log(self, message: str, data: Any = None):
-        """Log debug information"""
-        if data:
-            logger.debug(f"{message}: {json.dumps(data, indent=2, default=str)}")
+    def log_prompt(self, messages: list[dict[str, Any]] | dict[str, Any]) -> None:
+        if not messages:
+            logger.debug('No completion messages!')
+            return
+
+        messages = messages if isinstance(messages, list) else [messages]
+        debug_message = MESSAGE_SEPARATOR.join(
+            self._format_message_content(msg)
+            for msg in messages
+            if msg['content'] is not None
+        )
+
+        if debug_message:
+            llm_prompt_logger.debug(debug_message)
         else:
-            logger.debug(message)
-    
-    def log_request(self, messages: list, **kwargs):
-        """Log LLM request"""
-        self.debug_log("LLM Request", {
-            "model": getattr(self, 'model_name', 'unknown'),
-            "messages": messages,
-            "kwargs": kwargs
-        })
-    
-    def log_response(self, response: Any):
-        """Log LLM response"""
-        self.debug_log("LLM Response", {
-            "model": getattr(self, 'model_name', 'unknown'),
-            "response": response
-        })
-    
-    def log_error(self, error: Exception):
-        """Log LLM error"""
-        logger.error(f"LLM Error: {error}")
+            logger.debug('No completion messages!')
+
+    def log_response(self, message_back: str) -> None:
+        if message_back:
+            llm_response_logger.debug(message_back)
+
+    def _format_message_content(self, message: dict[str, Any]) -> str:
+        content = message['content']
+        if isinstance(content, list):
+            return '\n'.join(
+                self._format_content_element(element) for element in content
+            )
+        return str(content)
+
+    def _format_content_element(self, element: dict[str, Any] | Any) -> str:
+        if isinstance(element, dict):
+            if 'text' in element:
+                return str(element['text'])
+            if (
+                self.vision_is_active()
+                and 'image_url' in element
+                and 'url' in element['image_url']
+            ):
+                return str(element['image_url']['url'])
+        return str(element)
+
+    # This method should be implemented in the class that uses DebugMixin
+    def vision_is_active(self) -> bool:
+        raise NotImplementedError

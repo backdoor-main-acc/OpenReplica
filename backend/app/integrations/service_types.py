@@ -1,430 +1,223 @@
-"""
-Service types for OpenReplica matching OpenHands exactly
-"""
-from __future__ import annotations
-
-from datetime import datetime
+from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any
+from typing import Any, Protocol
 
-from pydantic import BaseModel, Field
+from httpx import AsyncClient, HTTPError, HTTPStatusError
+from jinja2 import Environment, FileSystemLoader
+from pydantic import BaseModel, SecretStr
 
-
-class ProviderType(str, Enum):
-    """Supported provider types"""
-    GITHUB = "github"
-    GITLAB = "gitlab"
-    BITBUCKET = "bitbucket"
-    AZURE_DEVOPS = "azure_devops"
+from app.core.logger import openreplica_logger as logger
+from app.server.types import AppMode
 
 
-class AuthenticationError(Exception):
-    """Raised when authentication fails"""
-    pass
+class ProviderType(Enum):
+    GITHUB = 'github'
+    GITLAB = 'gitlab'
 
 
-class RepositoryNotFoundError(Exception):
-    """Raised when repository is not found"""
-    pass
-
-
-class User(BaseModel):
-    """User information from git providers"""
-    id: int | str
-    username: str
-    name: str | None = None
-    email: str | None = None
-    avatar_url: str | None = None
-    profile_url: str | None = None
-    bio: str | None = None
-    company: str | None = None
-    location: str | None = None
-    blog: str | None = None
-    public_repos: int | None = None
-    followers: int | None = None
-    following: int | None = None
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
-
-
-class Repository(BaseModel):
-    """Repository information from git providers"""
-    id: int | str
-    name: str
-    full_name: str
-    description: str | None = None
-    private: bool = False
-    fork: bool = False
-    archived: bool = False
-    disabled: bool = False
-    html_url: str
-    clone_url: str
-    ssh_url: str | None = None
-    default_branch: str = "main"
-    language: str | None = None
-    languages: dict[str, int] | None = None
-    topics: list[str] | None = None
-    size: int | None = None
-    stargazers_count: int | None = None
-    watchers_count: int | None = None
-    forks_count: int | None = None
-    open_issues_count: int | None = None
-    license: str | None = None
-    owner: User
-    permissions: dict[str, bool] | None = None
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
-    pushed_at: datetime | None = None
-
-
-class Branch(BaseModel):
-    """Branch information from git providers"""
-    name: str
-    sha: str
-    protected: bool = False
-    protection_url: str | None = None
-    commit: dict[str, Any] | None = None
-
-
-class PullRequest(BaseModel):
-    """Pull request information from git providers"""
-    id: int | str
-    number: int
-    title: str
-    body: str | None = None
-    state: str  # open, closed, merged
-    draft: bool = False
-    mergeable: bool | None = None
-    rebaseable: bool | None = None
-    head: dict[str, Any]
-    base: dict[str, Any]
-    user: User
-    assignees: list[User] | None = None
-    reviewers: list[User] | None = None
-    labels: list[dict[str, Any]] | None = None
-    milestone: dict[str, Any] | None = None
-    html_url: str
-    diff_url: str | None = None
-    patch_url: str | None = None
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
-    closed_at: datetime | None = None
-    merged_at: datetime | None = None
-
-
-class Issue(BaseModel):
-    """Issue information from git providers"""
-    id: int | str
-    number: int
-    title: str
-    body: str | None = None
-    state: str  # open, closed
-    locked: bool = False
-    user: User
-    assignees: list[User] | None = None
-    labels: list[dict[str, Any]] | None = None
-    milestone: dict[str, Any] | None = None
-    comments: int | None = None
-    html_url: str
-    repository_url: str | None = None
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
-    closed_at: datetime | None = None
+class TaskType(str, Enum):
+    MERGE_CONFLICTS = 'MERGE_CONFLICTS'
+    FAILING_CHECKS = 'FAILING_CHECKS'
+    UNRESOLVED_COMMENTS = 'UNRESOLVED_COMMENTS'
+    OPEN_ISSUE = 'OPEN_ISSUE'
+    OPEN_PR = 'OPEN_PR'
 
 
 class SuggestedTask(BaseModel):
-    """Suggested task for a repository"""
+    git_provider: ProviderType
+    task_type: TaskType
+    repo: str
+    issue_number: int
     title: str
-    description: str
-    type: str  # "feature", "bug", "improvement", "documentation", etc.
-    priority: str = "medium"  # "low", "medium", "high", "critical"
-    estimated_effort: str | None = None  # "small", "medium", "large"
-    labels: list[str] | None = None
-    files_to_modify: list[str] | None = None
-    related_issues: list[int] | None = None
-    context: dict[str, Any] | None = None
+
+    def get_provider_terms(self) -> dict:
+        if self.git_provider == ProviderType.GITLAB:
+            return {
+                'requestType': 'Merge Request',
+                'requestTypeShort': 'MR',
+                'apiName': 'GitLab API',
+                'tokenEnvVar': 'GITLAB_TOKEN',
+                'ciSystem': 'CI pipelines',
+                'ciProvider': 'GitLab',
+                'requestVerb': 'merge request',
+            }
+        elif self.git_provider == ProviderType.GITHUB:
+            return {
+                'requestType': 'Pull Request',
+                'requestTypeShort': 'PR',
+                'apiName': 'GitHub API',
+                'tokenEnvVar': 'GITHUB_TOKEN',
+                'ciSystem': 'GitHub Actions',
+                'ciProvider': 'GitHub',
+                'requestVerb': 'pull request',
+            }
+
+        raise ValueError(f'Provider {self.git_provider} for suggested task prompts')
+
+    def get_prompt_for_task(
+        self,
+    ) -> str:
+        task_type = self.task_type
+        issue_number = self.issue_number
+        repo = self.repo
+
+        env = Environment(
+            loader=FileSystemLoader('openhands/integrations/templates/suggested_task')
+        )
+
+        template = None
+        if task_type == TaskType.MERGE_CONFLICTS:
+            template = env.get_template('merge_conflict_prompt.j2')
+        elif task_type == TaskType.FAILING_CHECKS:
+            template = env.get_template('failing_checks_prompt.j2')
+        elif task_type == TaskType.UNRESOLVED_COMMENTS:
+            template = env.get_template('unresolved_comments_prompt.j2')
+        elif task_type == TaskType.OPEN_ISSUE:
+            template = env.get_template('open_issue_prompt.j2')
+        else:
+            raise ValueError(f'Unsupported task type: {task_type}')
+
+        terms = self.get_provider_terms()
+
+        return template.render(issue_number=issue_number, repo=repo, **terms)
 
 
-class Commit(BaseModel):
-    """Commit information from git providers"""
-    sha: str
-    message: str
-    author: dict[str, Any]
-    committer: dict[str, Any]
-    tree: dict[str, Any]
-    parents: list[dict[str, Any]] | None = None
-    html_url: str | None = None
-    stats: dict[str, Any] | None = None
-    files: list[dict[str, Any]] | None = None
-    created_at: datetime | None = None
-
-
-class Comment(BaseModel):
-    """Comment information from git providers"""
-    id: int | str
-    body: str
-    user: User
-    html_url: str | None = None
-    issue_url: str | None = None
-    pull_request_url: str | None = None
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
-
-
-class Release(BaseModel):
-    """Release information from git providers"""
-    id: int | str
-    tag_name: str
+class User(BaseModel):
+    id: int
+    login: str
+    avatar_url: str
+    company: str | None = None
     name: str | None = None
-    body: str | None = None
-    draft: bool = False
-    prerelease: bool = False
-    target_commitish: str | None = None
-    html_url: str | None = None
-    tarball_url: str | None = None
-    zipball_url: str | None = None
-    assets: list[dict[str, Any]] | None = None
-    author: User | None = None
-    created_at: datetime | None = None
-    published_at: datetime | None = None
+    email: str | None = None
 
 
-class GitService:
-    """Base interface for git service integrations"""
-    
+class Branch(BaseModel):
+    name: str
+    commit_sha: str
+    protected: bool
+    last_push_date: str | None = None  # ISO 8601 format date string
+
+
+class Repository(BaseModel):
+    id: int
+    full_name: str
+    git_provider: ProviderType
+    is_public: bool
+    stargazers_count: int | None = None
+    link_header: str | None = None
+    pushed_at: str | None = None  # ISO 8601 format date string
+
+
+class AuthenticationError(ValueError):
+    """Raised when there is an issue with GitHub authentication."""
+
+    pass
+
+
+class UnknownException(ValueError):
+    """Raised when there is an issue with GitHub communcation."""
+
+    pass
+
+
+class RateLimitError(ValueError):
+    """Raised when the git provider's API rate limits are exceeded."""
+
+    pass
+
+
+class RequestMethod(Enum):
+    POST = 'post'
+    GET = 'get'
+
+
+class BaseGitService(ABC):
+    @property
+    def provider(self) -> str:
+        raise NotImplementedError('Subclasses must implement the provider property')
+
+    # Method used to satisfy mypy for abstract class definition
+    @abstractmethod
+    async def _make_request(
+        self,
+        url: str,
+        params: dict | None = None,
+        method: RequestMethod = RequestMethod.GET,
+    ) -> tuple[Any, dict]: ...
+
+    async def execute_request(
+        self,
+        client: AsyncClient,
+        url: str,
+        headers: dict,
+        params: dict | None,
+        method: RequestMethod = RequestMethod.GET,
+    ):
+        if method == RequestMethod.POST:
+            return await client.post(url, headers=headers, json=params)
+        return await client.get(url, headers=headers, params=params)
+
+    def handle_http_status_error(
+        self, e: HTTPStatusError
+    ) -> AuthenticationError | RateLimitError | UnknownException:
+        if e.response.status_code == 401:
+            return AuthenticationError(f'Invalid {self.provider} token')
+        elif e.response.status_code == 429:
+            logger.warning(f'Rate limit exceeded on {self.provider} API: {e}')
+            return RateLimitError('GitHub API rate limit exceeded')
+
+        logger.warning(f'Status error on {self.provider} API: {e}')
+        return UnknownException('Unknown error')
+
+    def handle_http_error(self, e: HTTPError) -> UnknownException:
+        logger.warning(f'HTTP error on {self.provider} API: {type(e).__name__} : {e}')
+        return UnknownException(f'HTTP error {type(e).__name__}')
+
+
+class GitService(Protocol):
+    """Protocol defining the interface for Git service providers"""
+
+    def __init__(
+        self,
+        user_id: str | None = None,
+        token: SecretStr | None = None,
+        external_auth_id: str | None = None,
+        external_auth_token: SecretStr | None = None,
+        external_token_manager: bool = False,
+    ) -> None:
+        """Initialize the service with authentication details"""
+        ...
+
+    async def get_latest_token(self) -> SecretStr | None:
+        """Get latest working token of the user"""
+        ...
+
     async def get_user(self) -> User:
-        """Get authenticated user information"""
-        raise NotImplementedError
-    
-    async def list_repositories(
-        self, 
-        visibility: str = "all",
-        sort: str = "updated",
-        per_page: int = 30,
-        page: int = 1
-    ) -> list[Repository]:
-        """List user repositories"""
-        raise NotImplementedError
-    
-    async def get_repository(self, repo_name: str) -> Repository:
-        """Get repository information"""
-        raise NotImplementedError
-    
-    async def create_repository(
-        self, 
-        name: str, 
-        description: str | None = None,
-        private: bool = True,
-        auto_init: bool = False
-    ) -> Repository:
-        """Create a new repository"""
-        raise NotImplementedError
-    
-    async def fork_repository(self, repo_name: str) -> Repository:
-        """Fork a repository"""
-        raise NotImplementedError
-    
-    async def list_branches(self, repo_name: str) -> list[Branch]:
-        """List repository branches"""
-        raise NotImplementedError
-    
-    async def get_branch(self, repo_name: str, branch_name: str) -> Branch:
-        """Get branch information"""
-        raise NotImplementedError
-    
-    async def create_branch(
-        self, 
-        repo_name: str, 
-        branch_name: str, 
-        from_branch: str = "main"
-    ) -> Branch:
-        """Create a new branch"""
-        raise NotImplementedError
-    
-    async def list_pull_requests(
-        self,
-        repo_name: str,
-        state: str = "open",
-        sort: str = "created",
-        direction: str = "desc"
-    ) -> list[PullRequest]:
-        """List pull requests"""
-        raise NotImplementedError
-    
-    async def get_pull_request(self, repo_name: str, pr_number: int) -> PullRequest:
-        """Get pull request information"""
-        raise NotImplementedError
-    
-    async def create_pull_request(
-        self,
-        repo_name: str,
-        title: str,
-        body: str,
-        head_branch: str,
-        base_branch: str = "main",
-        draft: bool = False
-    ) -> PullRequest:
-        """Create a pull request"""
-        raise NotImplementedError
-    
-    async def list_issues(
-        self,
-        repo_name: str,
-        state: str = "open",
-        sort: str = "created",
-        direction: str = "desc"
-    ) -> list[Issue]:
-        """List issues"""
-        raise NotImplementedError
-    
-    async def get_issue(self, repo_name: str, issue_number: int) -> Issue:
-        """Get issue information"""
-        raise NotImplementedError
-    
-    async def create_issue(
-        self,
-        repo_name: str,
-        title: str,
-        body: str | None = None,
-        labels: list[str] | None = None,
-        assignees: list[str] | None = None
-    ) -> Issue:
-        """Create an issue"""
-        raise NotImplementedError
-    
-    async def list_commits(
-        self,
-        repo_name: str,
-        branch: str | None = None,
-        since: datetime | None = None,
-        until: datetime | None = None
-    ) -> list[Commit]:
-        """List repository commits"""
-        raise NotImplementedError
-    
-    async def get_commit(self, repo_name: str, sha: str) -> Commit:
-        """Get commit information"""
-        raise NotImplementedError
-    
-    async def list_releases(self, repo_name: str) -> list[Release]:
-        """List repository releases"""
-        raise NotImplementedError
-    
-    async def get_release(self, repo_name: str, release_id: str) -> Release:
-        """Get release information"""
-        raise NotImplementedError
-    
-    async def get_file_content(
-        self, 
-        repo_name: str, 
-        file_path: str, 
-        branch: str | None = None
-    ) -> dict[str, Any]:
-        """Get file content from repository"""
-        raise NotImplementedError
-    
-    async def create_file(
-        self,
-        repo_name: str,
-        file_path: str,
-        content: str,
-        message: str,
-        branch: str | None = None
-    ) -> dict[str, Any]:
-        """Create a file in repository"""
-        raise NotImplementedError
-    
-    async def update_file(
-        self,
-        repo_name: str,
-        file_path: str,
-        content: str,
-        message: str,
-        sha: str,
-        branch: str | None = None
-    ) -> dict[str, Any]:
-        """Update a file in repository"""
-        raise NotImplementedError
-    
-    async def delete_file(
-        self,
-        repo_name: str,
-        file_path: str,
-        message: str,
-        sha: str,
-        branch: str | None = None
-    ) -> dict[str, Any]:
-        """Delete a file from repository"""
-        raise NotImplementedError
-    
-    async def get_suggested_tasks(self, repo_name: str) -> list[SuggestedTask]:
-        """Get AI-suggested tasks for the repository"""
-        # Default implementation returns empty list
-        # Subclasses can override to provide intelligent suggestions
-        return []
-    
+        """Get the authenticated user's information"""
+        ...
+
     async def search_repositories(
         self,
         query: str,
-        sort: str = "stars",
-        order: str = "desc",
-        per_page: int = 30
+        per_page: int,
+        sort: str,
+        order: str,
     ) -> list[Repository]:
-        """Search repositories"""
-        raise NotImplementedError
-    
-    async def search_code(
-        self,
-        query: str,
-        repo_name: str | None = None,
-        sort: str = "indexed",
-        order: str = "desc"
-    ) -> dict[str, Any]:
-        """Search code"""
-        raise NotImplementedError
-    
-    async def get_repository_stats(self, repo_name: str) -> dict[str, Any]:
-        """Get repository statistics"""
-        raise NotImplementedError
-    
-    async def get_repository_languages(self, repo_name: str) -> dict[str, int]:
-        """Get repository programming languages"""
-        raise NotImplementedError
-    
-    async def get_repository_topics(self, repo_name: str) -> list[str]:
-        """Get repository topics/tags"""
-        raise NotImplementedError
+        """Search for repositories"""
+        ...
 
+    async def get_repositories(self, sort: str, app_mode: AppMode) -> list[Repository]:
+        """Get repositories for the authenticated user"""
+        ...
 
-class WebhookEvent(BaseModel):
-    """Webhook event from git providers"""
-    event_type: str
-    action: str | None = None
-    repository: Repository | None = None
-    sender: User | None = None
-    organization: dict[str, Any] | None = None
-    installation: dict[str, Any] | None = None
-    pull_request: PullRequest | None = None
-    issue: Issue | None = None
-    comment: Comment | None = None
-    commit: Commit | None = None
-    branch: Branch | None = None
-    release: Release | None = None
-    payload: dict[str, Any] | None = None
-    timestamp: datetime = Field(default_factory=datetime.now)
+    async def get_suggested_tasks(self) -> list[SuggestedTask]:
+        """Get suggested tasks for the authenticated user across all repositories"""
+        ...
 
+    async def get_repository_details_from_repo_name(
+        self, repository: str
+    ) -> Repository:
+        """Gets all repository details from repository name"""
 
-class GitServiceFactory:
-    """Factory for creating git service instances"""
-    
-    @staticmethod
-    def create_service(provider_type: ProviderType, token: str, host: str | None = None) -> GitService:
-        """Create git service instance"""
-        if provider_type == ProviderType.GITHUB:
-            from app.integrations.github.github_service import GithubServiceImpl
-            return GithubServiceImpl(token, host)
-        elif provider_type == ProviderType.GITLAB:
-            from app.integrations.gitlab.gitlab_service import GitLabServiceImpl
-            return GitLabServiceImpl(token, host)
-        else:
-            raise ValueError(f"Unsupported provider type: {provider_type}")
+    async def get_branches(self, repository: str) -> list[Branch]:
+        """Get branches for a repository"""

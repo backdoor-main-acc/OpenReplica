@@ -1,6 +1,4 @@
-"""
-CodeAct Agent for OpenReplica matching OpenHands exactly
-"""
-from .codeact_agent import CodeActAgent
+from app.agenthub.codeact_agent.codeact_agent import CodeActAgent
+from app.controller.agent import Agent
 
-__all__ = ["CodeActAgent"]
+Agent.register('CodeActAgent', CodeActAgent)

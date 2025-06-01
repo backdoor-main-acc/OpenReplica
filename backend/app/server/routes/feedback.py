@@ -1,90 +1,60 @@
-"""
-Feedback routes for OpenReplica matching OpenHands exactly
-"""
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from typing import Optional, Dict, Any
 
-from app.core.logging import get_logger
+from app.core.logger import openreplica_logger as logger
+from app.events.async_event_store_wrapper import AsyncEventStoreWrapper
+from app.events.serialization import event_to_dict
+from app.server.data_models.feedback import FeedbackDataModel, store_feedback
 from app.server.dependencies import get_dependencies
-from app.server.user_auth import get_user_id
+from app.utils.async_utils import call_sync_from_async
 
-logger = get_logger(__name__)
-
-app = APIRouter(prefix='/api/feedback', dependencies=get_dependencies())
+app = APIRouter(prefix='/api/conversations/{conversation_id}', dependencies=get_dependencies())
 
 
-class FeedbackRequest(BaseModel):
-    """Request model for user feedback"""
-    type: str  # "bug", "feature", "general", "rating"
-    message: str
-    email: Optional[str] = None
-    user_agent: Optional[str] = None
-    url: Optional[str] = None
-    conversation_id: Optional[str] = None
-    rating: Optional[int] = None  # 1-5 stars
-    metadata: Optional[Dict[str, Any]] = None
+@app.post('/submit-feedback')
+async def submit_feedback(request: Request, conversation_id: str) -> JSONResponse:
+    """Submit user feedback.
 
+    This function stores the provided feedback data.
 
-@app.post('/submit')
-async def submit_feedback(
-    feedback: FeedbackRequest,
-    user_id: str = Depends(get_user_id)
-) -> JSONResponse:
-    """Submit user feedback"""
+    To submit feedback:
+    ```sh
+    curl -X POST -d '{"email": "test@example.com"}' -H "Authorization:"
+    ```
+
+    Args:
+        request (Request): The incoming request object.
+        feedback (FeedbackDataModel): The feedback data to be stored.
+
+    Returns:
+        dict: The stored feedback data.
+
+    Raises:
+        HTTPException: If there's an error submitting the feedback.
+    """
+    # Assuming the storage service is already configured in the backend
+    # and there is a function to handle the storage.
+    body = await request.json()
+    async_store = AsyncEventStoreWrapper(
+        request.state.conversation.event_stream, filter_hidden=True
+    )
+    trajectory = []
+    async for event in async_store:
+        trajectory.append(event_to_dict(event))
+    feedback = FeedbackDataModel(
+        email=body.get('email', ''),
+        version=body.get('version', ''),
+        permissions=body.get('permissions', 'private'),
+        polarity=body.get('polarity', ''),
+        feedback=body.get('polarity', ''),
+        trajectory=trajectory,
+    )
     try:
-        # In a real implementation, this would save to a database or send to a service
-        logger.info(
-            f"Feedback submitted by user {user_id}",
-            extra={
-                "user_id": user_id,
-                "feedback_type": feedback.type,
-                "rating": feedback.rating,
-                "conversation_id": feedback.conversation_id
-            }
-        )
-        
-        # For now, just log the feedback
-        logger.info(f"Feedback content: {feedback.message}")
-        
-        return JSONResponse({
-            "success": True,
-            "message": "Thank you for your feedback! We appreciate your input."
-        })
-        
+        feedback_data = await call_sync_from_async(store_feedback, feedback)
+        return JSONResponse(status_code=status.HTTP_200_OK, content=feedback_data)
     except Exception as e:
-        logger.error(f"Error submitting feedback: {e}")
+        logger.error(f'Error submitting feedback: {e}')
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"error": "Failed to submit feedback"}
-        )
-
-
-@app.get('/stats')
-async def get_feedback_stats(
-    user_id: str = Depends(get_user_id)
-) -> JSONResponse:
-    """Get feedback statistics (admin only)"""
-    try:
-        # Mock statistics - in real implementation, query database
-        stats = {
-            "total_feedback": 0,
-            "by_type": {
-                "bug": 0,
-                "feature": 0,
-                "general": 0,
-                "rating": 0
-            },
-            "average_rating": 0.0,
-            "recent_feedback": []
-        }
-        
-        return JSONResponse(stats)
-        
-    except Exception as e:
-        logger.error(f"Error getting feedback stats: {e}")
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"error": "Failed to get feedback statistics"}
+            content={'error': 'Failed to submit feedback'},
         )

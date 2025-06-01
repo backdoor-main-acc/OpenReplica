@@ -1,6 +1,3 @@
-"""
-Files routes for OpenReplica matching OpenHands exactly
-"""
 import os
 from typing import Any
 
@@ -17,19 +14,27 @@ from pathspec.patterns import GitWildMatchPattern
 from starlette.background import BackgroundTask
 
 from app.core.exceptions import AgentRuntimeUnavailableError
-from app.core.logging import get_logger
-from app.events.action import FileReadAction
-from app.events.observation import ErrorObservation, FileReadObservation
+from app.core.logger import openreplica_logger as logger
+from app.events.action import (
+    FileReadAction,
+)
+from app.events.observation import (
+    ErrorObservation,
+    FileReadObservation,
+)
 from app.runtime.base import Runtime
 from app.server.dependencies import get_dependencies
-from app.server.file_config import FILES_TO_IGNORE
-from app.server.shared import ConversationStoreImpl, config
+from app.server.file_config import (
+    FILES_TO_IGNORE,
+)
+from app.server.shared import (
+    ConversationStoreImpl,
+    config,
+)
 from app.server.user_auth import get_user_id
 from app.server.utils import get_conversation_store
 from app.storage.conversation.conversation_store import ConversationStore
 from app.utils.async_utils import call_sync_from_async
-
-logger = get_logger(__name__)
 
 app = APIRouter(prefix='/api/conversations/{conversation_id}', dependencies=get_dependencies())
 
@@ -90,21 +95,19 @@ async def list_files(
         try:
             read_action = FileReadAction(gitignore_path)
             observation = await call_sync_from_async(runtime.run_action, read_action)
-            if isinstance(observation, FileReadObservation):
-                spec = PathSpec.from_lines(
-                    GitWildMatchPattern, observation.content.splitlines()
-                )
-                return [f for f in file_list if not spec.match_file(f)]
-        except Exception:
-            pass
+            spec = PathSpec.from_lines(
+                GitWildMatchPattern, observation.content.splitlines()
+            )
+        except Exception as e:
+            logger.warning(e)
+            return file_list
+        file_list = [entry for entry in file_list if not spec.match_file(entry)]
         return file_list
 
     try:
-        file_list = await filter_for_gitignore(
-            file_list, runtime.config.workspace_mount_path_in_sandbox
-        )
-    except Exception as e:
-        logger.error(f'Error filtering files with gitignore: {e}')
+        file_list = await filter_for_gitignore(file_list, '')
+    except AgentRuntimeUnavailableError as e:
+        logger.error(f'Error filtering files: {e}')
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={'error': f'Error filtering files: {e}'},
@@ -113,152 +116,91 @@ async def list_files(
     return file_list
 
 
+# NOTE: We use response_model=None for endpoints that can return multiple response types
+# (like FileResponse | JSONResponse). This is because FastAPI's response_model expects a
+# Pydantic model, but Starlette response classes like FileResponse are not Pydantic models.
+# Instead, we document the possible responses using the 'responses' parameter and maintain
+# proper type annotations for mypy.
 @app.get(
-    '/read-file',
-    response_model=str,
+    '/select-file',
+    response_model=None,
     responses={
-        404: {'description': 'File not found or runtime not initialized', 'model': dict},
-        500: {'description': 'Error reading file', 'model': dict},
+        200: {'description': 'File content returned as JSON', 'model': dict[str, str]},
+        500: {'description': 'Error opening file', 'model': dict},
+        415: {'description': 'Unsupported media type', 'model': dict},
     },
 )
-async def read_file(request: Request, path: str) -> str | JSONResponse:
-    """Read the content of a file.
+async def select_file(file: str, request: Request) -> FileResponse | JSONResponse:
+    """Retrieve the content of a specified file.
+
+    To select a file:
+    ```sh
+    curl http://localhost:3000/api/conversations/{conversation_id}select-file?file=<file_path>
+    ```
 
     Args:
+        file (str): The path of the file to be retrieved.
+            Expect path to be absolute inside the runtime.
         request (Request): The incoming request object.
-        path (str): The path to the file to read.
 
     Returns:
-        str: The content of the file.
+        dict: A dictionary containing the file content.
 
     Raises:
-        HTTPException: If there's an error reading the file.
+        HTTPException: If there's an error opening the file.
     """
-    if not request.state.conversation.runtime:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content={'error': 'Runtime not yet initialized'},
-        )
-
     runtime: Runtime = request.state.conversation.runtime
+
+    file = os.path.join(runtime.config.workspace_mount_path_in_sandbox, file)
+    read_action = FileReadAction(file)
     try:
-        read_action = FileReadAction(path)
         observation = await call_sync_from_async(runtime.run_action, read_action)
-        
-        if isinstance(observation, ErrorObservation):
-            if 'File not found' in observation.content:
-                return JSONResponse(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    content={'error': f'File not found: {path}'},
-                )
-            else:
-                return JSONResponse(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    content={'error': observation.content},
-                )
-        elif isinstance(observation, FileReadObservation):
-            return observation.content
-        else:
-            return JSONResponse(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                content={'error': 'Unexpected observation type'},
-            )
     except AgentRuntimeUnavailableError as e:
-        logger.error(f'Runtime unavailable when reading file: {e}')
+        logger.error(f'Error opening file {file}: {e}')
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={'error': f'Runtime unavailable: {e}'},
+            content={'error': f'Error opening file: {e}'},
         )
-    except Exception as e:
-        logger.error(f'Error reading file {path}: {e}')
+
+    if isinstance(observation, FileReadObservation):
+        content = observation.content
+        return JSONResponse(content={'code': content})
+    elif isinstance(observation, ErrorObservation):
+        logger.error(f'Error opening file {file}: {observation}')
+
+        if 'ERROR_BINARY_FILE' in observation.message:
+            return JSONResponse(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                content={'error': f'Unable to open binary file: {file}'},
+            )
+
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={'error': f'Error reading file: {e}'},
+            content={'error': f'Error opening file: {observation}'},
+        )
+    else:
+        # Handle unexpected observation types
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={'error': f'Unexpected observation type: {type(observation)}'},
         )
 
 
 @app.get(
-    '/download-file',
-    response_class=FileResponse,
+    '/zip-directory',
+    response_model=None,
     responses={
-        404: {'description': 'File not found or runtime not initialized', 'model': dict},
-        500: {'description': 'Error downloading file', 'model': dict},
-    },
-)
-async def download_file(request: Request, path: str) -> FileResponse | JSONResponse:
-    """Download a file from the runtime.
-
-    Args:
-        request (Request): The incoming request object.
-        path (str): The path to the file to download.
-
-    Returns:
-        FileResponse: The file to download.
-
-    Raises:
-        HTTPException: If there's an error downloading the file.
-    """
-    if not request.state.conversation.runtime:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content={'error': 'Runtime not yet initialized'},
-        )
-
-    runtime: Runtime = request.state.conversation.runtime
-    try:
-        # Get file from runtime
-        local_path = await call_sync_from_async(runtime.copy_from, path)
-        
-        if not os.path.exists(local_path):
-            return JSONResponse(
-                status_code=status.HTTP_404_NOT_FOUND,
-                content={'error': f'File not found: {path}'},
-            )
-
-        filename = os.path.basename(path)
-        return FileResponse(
-            path=local_path,
-            filename=filename,
-            background=BackgroundTask(lambda: os.unlink(local_path)),
-        )
-    except AgentRuntimeUnavailableError as e:
-        logger.error(f'Runtime unavailable when downloading file: {e}')
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={'error': f'Runtime unavailable: {e}'},
-        )
-    except Exception as e:
-        logger.error(f'Error downloading file {path}: {e}')
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={'error': f'Error downloading file: {e}'},
-        )
-
-
-@app.get(
-    '/download-workspace',
-    response_class=FileResponse,
-    responses={
+        200: {'description': 'Zipped workspace returned as FileResponse'},
         500: {'description': 'Error zipping workspace', 'model': dict},
     },
 )
-async def download_workspace(request: Request) -> FileResponse | JSONResponse:
-    """Download the entire workspace as a zip file.
-
-    Args:
-        request (Request): The incoming request object.
-
-    Returns:
-        FileResponse: The workspace zip file.
-
-    Raises:
-        HTTPException: If there's an error creating the zip file.
-    """
+def zip_current_workspace(request: Request) -> FileResponse | JSONResponse:
     try:
+        logger.debug('Zipping workspace')
         runtime: Runtime = request.state.conversation.runtime
         path = runtime.config.workspace_mount_path_in_sandbox
         try:
-            zip_file_path = await call_sync_from_async(runtime.copy_from, path)
+            zip_file_path = runtime.copy_from(path)
         except AgentRuntimeUnavailableError as e:
             logger.error(f'Error zipping workspace: {e}')
             return JSONResponse(
@@ -276,63 +218,6 @@ async def download_workspace(request: Request) -> FileResponse | JSONResponse:
         raise HTTPException(
             status_code=500,
             detail='Failed to zip workspace',
-        )
-
-
-@app.get(
-    '/conversation-history',
-    response_model=dict,
-    responses={
-        500: {'description': 'Error exporting conversation', 'model': dict},
-    },
-)
-async def download_conversation_history(
-    request: Request,
-    conversation_id: str,
-    user_id: str = Depends(get_user_id),
-) -> dict[str, Any] | JSONResponse:
-    """Download conversation history as JSON.
-
-    Args:
-        request (Request): The incoming request object.
-        conversation_id (str): The conversation ID.
-        user_id (str): The user ID.
-
-    Returns:
-        dict: The conversation history.
-    """
-    try:
-        conversation_store = await ConversationStoreImpl.get_instance(
-            config, user_id
-        )
-        
-        # Get conversation metadata
-        metadata = await conversation_store.get_metadata(conversation_id)
-        if not metadata:
-            return JSONResponse(
-                status_code=404,
-                content={'error': 'Conversation not found'},
-            )
-        
-        # Get conversation events
-        events = await conversation_store.get_events(conversation_id)
-        
-        # Export conversation data
-        conversation_data = {
-            'conversation_id': conversation_id,
-            'metadata': metadata.dict() if metadata else {},
-            'events': [event.dict() for event in events],
-            'export_timestamp': str(int(time.time())),
-            'total_events': len(events)
-        }
-        
-        return conversation_data
-        
-    except Exception as e:
-        logger.error(f'Error exporting conversation {conversation_id}: {e}')
-        return JSONResponse(
-            status_code=500,
-            content={'error': f'Error exporting conversation: {e}'},
         )
 
 

@@ -1,6 +1,3 @@
-"""
-Agent base class for OpenReplica matching OpenHands exactly
-"""
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -18,12 +15,10 @@ from app.core.exceptions import (
     AgentAlreadyRegisteredError,
     AgentNotRegisteredError,
 )
-from app.core.logging import get_logger
+from app.core.logger import openreplica_logger as logger
 from app.events.event import EventSource
 from app.llm.llm import LLM
 from app.runtime.plugins import PluginRequirement
-
-logger = get_logger(__name__)
 
 
 class Agent(ABC):
@@ -49,11 +44,6 @@ class Agent(ABC):
         self._prompt_manager: 'PromptManager' | None = None
         self.mcp_tools: dict[str, ChatCompletionToolParam] = {}
         self.tools: list = []
-
-    @property
-    def name(self) -> str:
-        """Get the agent name"""
-        return self.__class__.__name__
 
     @property
     def prompt_manager(self) -> 'PromptManager':
@@ -109,85 +99,85 @@ class Agent(ABC):
     def step(self, state: 'State') -> 'Action':
         """Starts the execution of the assigned instruction. This method should
         be implemented by subclasses to define the specific execution logic.
-
-        Parameters:
-        - state (State): The current state of the agent.
-
-        Returns:
-        - Action: The action to be executed by the agent.
         """
         pass
 
+    def reset(self) -> None:
+        """Resets the agent's execution status and clears the history. This method can be used
+        to prepare the agent for restarting the instruction or cleaning up before destruction.
+
+        """
+        # TODO clear history
+        self._complete = False
+
+        if self.llm:
+            self.llm.reset()
+
+    @property
+    def name(self) -> str:
+        return self.__class__.__name__
+
     @classmethod
     def register(cls, name: str, agent_cls: type['Agent']) -> None:
-        """Register an agent class.
+        """Registers an agent class in the registry.
 
-        Args:
-            name: The name to register the agent under.
-            agent_cls: The agent class to register.
+        Parameters:
+        - name (str): The name to register the class under.
+        - agent_cls (Type['Agent']): The class to register.
 
         Raises:
-            AgentAlreadyRegisteredError: If an agent with the same name is already registered.
+        - AgentAlreadyRegisteredError: If name already registered
         """
         if name in cls._registry:
-            raise AgentAlreadyRegisteredError(f'Agent {name} already registered')
-        
+            raise AgentAlreadyRegisteredError(name)
         cls._registry[name] = agent_cls
-        logger.info(f'Registered agent: {name}')
 
     @classmethod
     def get_cls(cls, name: str) -> type['Agent']:
-        """Get an agent class by name.
+        """Retrieves an agent class from the registry.
 
-        Args:
-            name: The name of the agent class to retrieve.
+        Parameters:
+        - name (str): The name of the class to retrieve
 
         Returns:
-            The agent class.
+        - agent_cls (Type['Agent']): The class registered under the specified name.
 
         Raises:
-            AgentNotRegisteredError: If no agent with the given name is registered.
+        - AgentNotRegisteredError: If name not registered
         """
         if name not in cls._registry:
-            raise AgentNotRegisteredError(f'Agent {name} not registered')
-        
+            raise AgentNotRegisteredError(name)
         return cls._registry[name]
 
     @classmethod
     def list_agents(cls) -> list[str]:
-        """List all registered agent names.
+        """Retrieves the list of all agent names from the registry.
 
-        Returns:
-            A list of registered agent names.
+        Raises:
+        - AgentNotRegisteredError: If no agent is registered
         """
+        if not bool(cls._registry):
+            raise AgentNotRegisteredError()
         return list(cls._registry.keys())
 
-    @classmethod
-    def get_agent_cls_by_name(cls, name: str) -> type['Agent']:
-        """Get agent class by name (alias for get_cls for compatibility)"""
-        return cls.get_cls(name)
+    def set_mcp_tools(self, mcp_tools: list[dict]) -> None:
+        """Sets the list of MCP tools for the agent.
 
-    def set_prompt_manager(self, prompt_manager: 'PromptManager') -> None:
-        """Set the prompt manager for this agent"""
-        self._prompt_manager = prompt_manager
-
-    def get_action_and_observation_sets(self) -> tuple[set[type], set[type]]:
+        Args:
+        - mcp_tools (list[dict]): The list of MCP tools.
         """
-        Get the action and observation sets for this agent.
-        This can be used to filter relevant events for the agent.
-        
-        Returns:
-            tuple: (action_types, observation_types) that this agent can handle
-        """
-        # Default implementation - subclasses should override if they need specific filtering
-        from app.events.action import Action
-        from app.events.observation import Observation
-        
-        return {Action}, {Observation}
-
-    def reset(self) -> None:
-        """Reset the agent to its initial state"""
-        self._complete = False
-
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(complete={self._complete})"
+        logger.info(
+            f'Setting {len(mcp_tools)} MCP tools for agent {self.name}: {[tool["function"]["name"] for tool in mcp_tools]}'
+        )
+        for tool in mcp_tools:
+            _tool = ChatCompletionToolParam(**tool)
+            if _tool['function']['name'] in self.mcp_tools:
+                logger.warning(
+                    f'Tool {_tool["function"]["name"]} already exists, skipping'
+                )
+                continue
+            self.mcp_tools[_tool['function']['name']] = _tool
+            self.tools.append(_tool)
+        logger.info(
+            f'Tools updated for agent {self.name}, total {len(self.tools)}: {[tool["function"]["name"] for tool in self.tools]}'
+        )
