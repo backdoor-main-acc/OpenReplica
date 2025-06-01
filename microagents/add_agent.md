@@ -17,7 +17,7 @@ triggers:
   - microagent template
 ---
 
-This agent helps create new microagents in the `.openhands/microagents` directory by providing guidance and templates.
+This agent helps create new microagents in the `.openreplica/microagents` directory by providing guidance and templates.
 
 Microagents are specialized prompts that provide context and capabilities for specific domains or tasks. They are activated by trigger words in the conversation and help the AI assistant understand what capabilities are available, how to use specific APIs or tools, what limitations exist, and how to handle common scenarios.
 
